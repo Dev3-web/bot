@@ -716,6 +716,16 @@ async def get_widget_code(request: WidgetRequest):
     except Exception as e:
         logger.error(f"Error fetching bot config: {e}")
     
+    # Position mapping for CSS
+    position_styles = {
+        "bottom-right": "bottom: 20px; right: 20px;",
+        "bottom-left": "bottom: 20px; left: 20px;",
+        "top-right": "top: 20px; right: 20px;",
+        "top-left": "top: 20px; left: 20px;"
+    }
+    
+    position_css = position_styles.get(widget_position, position_styles["bottom-right"])
+    
     widget_code = f"""
     <!-- Navigation Helper Bot Widget -->
     <div id="nav-helper-bot"></div>
@@ -728,27 +738,115 @@ async def get_widget_code(request: WidgetRequest):
                 color: '{widget_color}'
             }};
             
+            // Create widget container
             var botContainer = document.createElement('div');
             botContainer.id = 'nav-bot-container';
-            botContainer.style.cssText = 'position: fixed; bottom: 20px; right: 20px; z-index: 9999; width: 350px; height: 500px; background: white; border-radius: 10px; box-shadow: 0 4px 20px rgba(0,0,0,0.15); display: none;';
+            botContainer.style.cssText = `
+                position: fixed;
+                {position_css}
+                z-index: 9999;
+                width: 380px;
+                height: 600px;
+                background: rgba(255, 255, 255, 0.95);
+                backdrop-filter: blur(10px);
+                border-radius: 16px;
+                box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+                display: none;
+                overflow: hidden;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                border: 1px solid rgba(255, 255, 255, 0.3);
+                transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            `;
             
+            // Create toggle button
             var botToggle = document.createElement('button');
             botToggle.innerHTML = '💬';
-            botToggle.style.cssText = 'position: fixed; bottom: 20px; right: 20px; z-index: 10000; width: 60px; height: 60px; border-radius: 50%; border: none; background: ' + botConfig.color + '; color: white; font-size: 24px; cursor: pointer; box-shadow: 0 4px 20px rgba(0,0,0,0.15);';
+            botToggle.style.cssText = `
+                position: fixed;
+                {position_css}
+                z-index: 10000;
+                width: 64px;
+                height: 64px;
+                border-radius: 50%;
+                border: none;
+                background: linear-gradient(135deg, {widget_color}, #0056b3);
+                color: white;
+                font-size: 28px;
+                cursor: pointer;
+                box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+                transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            `;
             
+            // Add hover effects
+            botToggle.addEventListener('mouseenter', function() {{
+                this.style.transform = 'translateY(-2px)';
+                this.style.boxShadow = '0 6px 24px rgba(0,0,0,0.2)';
+            }});
+            
+            botToggle.addEventListener('mouseleave', function() {{
+                this.style.transform = 'translateY(0)';
+                this.style.boxShadow = '0 4px 20px rgba(0,0,0,0.15)';
+            }});
+            
+            // Toggle functionality
+            var isOpen = false;
             botToggle.onclick = function() {{
-                if (botContainer.style.display === 'none') {{
+                if (!isOpen) {{
                     botContainer.style.display = 'block';
+                    setTimeout(() => {{
+                        botContainer.style.opacity = '1';
+                        botContainer.style.transform = 'scale(1)';
+                    }}, 10);
                     botToggle.innerHTML = '✕';
+                    isOpen = true;
                 }} else {{
-                    botContainer.style.display = 'none';
+                    botContainer.style.opacity = '0';
+                    botContainer.style.transform = 'scale(0.95)';
+                    setTimeout(() => {{
+                        botContainer.style.display = 'none';
+                    }}, 300);
                     botToggle.innerHTML = '💬';
+                    isOpen = false;
                 }}
             }};
             
+            // Create iframe
             var iframe = document.createElement('iframe');
-            iframe.src = botConfig.apiUrl + '/widget';
-            iframe.style.cssText = 'width: 100%; height: 100%; border: none; border-radius: 10px;';
+            iframe.src = botConfig.apiUrl + '/widget?domain=' + encodeURIComponent(botConfig.domain);
+            iframe.style.cssText = 'width: 100%; height: 100%; border: none; border-radius: 16px;';
+            iframe.setAttribute('title', 'Navigation Helper Bot');
+            
+            // Add close on outside click
+            document.addEventListener('click', function(e) {{
+                if (isOpen && !botContainer.contains(e.target) && !botToggle.contains(e.target)) {{
+                    botToggle.click();
+                }}
+            }});
+            
+            // Add escape key handler
+            document.addEventListener('keydown', function(e) {{
+                if (e.key === 'Escape' && isOpen) {{
+                    botToggle.click();
+                }}
+            }});
+            
+            // Responsive adjustments
+            function adjustForMobile() {{
+                if (window.innerWidth < 480) {{
+                    botContainer.style.width = '95vw';
+                    botContainer.style.height = '85vh';
+                    botContainer.style.left = '2.5vw';
+                    botContainer.style.right = 'auto';
+                    botContainer.style.bottom = '2vh';
+                    botContainer.style.top = 'auto';
+                }}
+            }}
+            
+            window.addEventListener('resize', adjustForMobile);
+            adjustForMobile();
             
             botContainer.appendChild(iframe);
             document.body.appendChild(botContainer);
@@ -759,14 +857,12 @@ async def get_widget_code(request: WidgetRequest):
     
     return {"widget_code": widget_code, "domain": domain}
 
-# ALTERNATIVE: Keep the GET endpoint but with URL decoding
 @app.get("/api/widget-code/{domain:path}")
 async def get_widget_code_get(domain: str):
     """Generate widget code for integration (GET method with URL decoding)"""
-    # Decode the URL-encoded domain
     decoded_domain = unquote(domain)
     
-    # Get bot configuration if exists
+    # Get bot configuration
     widget_position = "bottom-right"
     widget_color = "#007bff"
     
@@ -781,117 +877,515 @@ async def get_widget_code_get(domain: str):
     except Exception as e:
         logger.error(f"Error fetching bot config: {e}")
     
-    widget_code = f"""
-    <!-- Navigation Helper Bot Widget -->
-    <div id="nav-helper-bot"></div>
-    <script>
-        (function() {{
-            var botConfig = {{
-                domain: '{decoded_domain}',
-                apiUrl: 'http://localhost:8000',
-                position: '{widget_position}',
-                color: '{widget_color}'
-            }};
-            
-            var botContainer = document.createElement('div');
-            botContainer.id = 'nav-bot-container';
-            botContainer.style.cssText = 'position: fixed; bottom: 20px; right: 20px; z-index: 9999; width: 350px; height: 500px; background: white; border-radius: 10px; box-shadow: 0 4px 20px rgba(0,0,0,0.15); display: none;';
-            
-            var botToggle = document.createElement('button');
-            botToggle.innerHTML = '💬';
-            botToggle.style.cssText = 'position: fixed; bottom: 20px; right: 20px; z-index: 10000; width: 60px; height: 60px; border-radius: 50%; border: none; background: ' + botConfig.color + '; color: white; font-size: 24px; cursor: pointer; box-shadow: 0 4px 20px rgba(0,0,0,0.15);';
-            
-            botToggle.onclick = function() {{
-                if (botContainer.style.display === 'none') {{
-                    botContainer.style.display = 'block';
-                    botToggle.innerHTML = '✕';
-                }} else {{
-                    botContainer.style.display = 'none';
-                    botToggle.innerHTML = '💬';
-                }}
-            }};
-            
-            var iframe = document.createElement('iframe');
-            iframe.src = botConfig.apiUrl + '/widget';
-            iframe.style.cssText = 'width: 100%; height: 100%; border: none; border-radius: 10px;';
-            
-            botContainer.appendChild(iframe);
-            document.body.appendChild(botContainer);
-            document.body.appendChild(botToggle);
-        }})();
-    </script>
-    """
-    
-    return {"widget_code": widget_code, "domain": decoded_domain}
+    # Reuse the POST endpoint logic
+    request = WidgetRequest(domain=decoded_domain)
+    return await get_widget_code(request)
 
 @app.get("/widget")
-async def widget_interface():
-    """Return the widget HTML interface"""
+async def widget_interface(domain: str = None):
+    """Return the improved widget HTML interface"""
     html_content = """
     <!DOCTYPE html>
-    <html>
+    <html lang="en">
     <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Navigation Helper Bot</title>
         <style>
-            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; }
-            .chat-container { height: 400px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; margin-bottom: 10px; }
-            .message { margin: 10px 0; padding: 8px; border-radius: 5px; }
-            .user-message { background: #007bff; color: white; text-align: right; }
-            .bot-message { background: #f8f9fa; border: 1px solid #ddd; }
-            .input-container { display: flex; }
-            .input-container input { flex: 1; padding: 10px; border: 1px solid #ddd; }
-            .input-container button { padding: 10px 20px; background: #007bff; color: white; border: none; cursor: pointer; }
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+                height: 100vh;
+                display: flex;
+                flex-direction: column;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: #333;
+            }
+            
+            .header {
+                background: rgba(255, 255, 255, 0.95);
+                backdrop-filter: blur(10px);
+                padding: 15px 20px;
+                border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+                display: flex;
+                align-items: center;
+                gap: 12px;
+            }
+            
+            .bot-avatar {
+                width: 36px;
+                height: 36px;
+                background: linear-gradient(135deg, #667eea, #764ba2);
+                border-radius: 50%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 18px;
+                color: white;
+            }
+            
+            .header-info h3 {
+                font-size: 16px;
+                font-weight: 600;
+                margin-bottom: 2px;
+            }
+            
+            .status {
+                font-size: 12px;
+                color: #28a745;
+                display: flex;
+                align-items: center;
+                gap: 4px;
+            }
+            
+            .status::before {
+                content: '';
+                width: 8px;
+                height: 8px;
+                background: #28a745;
+                border-radius: 50%;
+                animation: pulse 2s infinite;
+            }
+            
+            @keyframes pulse {
+                0% { opacity: 1; }
+                50% { opacity: 0.5; }
+                100% { opacity: 1; }
+            }
+            
+            .chat-container {
+                flex: 1;
+                overflow-y: auto;
+                padding: 20px;
+                display: flex;
+                flex-direction: column;
+                gap: 16px;
+                scroll-behavior: smooth;
+            }
+            
+            .chat-container::-webkit-scrollbar {
+                width: 6px;
+            }
+            
+            .chat-container::-webkit-scrollbar-track {
+                background: rgba(255, 255, 255, 0.1);
+                border-radius: 3px;
+            }
+            
+            .chat-container::-webkit-scrollbar-thumb {
+                background: rgba(255, 255, 255, 0.3);
+                border-radius: 3px;
+            }
+            
+            .message {
+                max-width: 85%;
+                padding: 12px 16px;
+                border-radius: 18px;
+                line-height: 1.4;
+                font-size: 14px;
+                position: relative;
+                animation: messageSlide 0.3s ease-out;
+                word-wrap: break-word;
+                overflow-wrap: break-word;
+            }
+            
+            @keyframes messageSlide {
+                from {
+                    opacity: 0;
+                    transform: translateY(10px);
+                }
+                to {
+                    opacity: 1;
+                    transform: translateY(0);
+                }
+            }
+            
+            .user-message {
+                background: linear-gradient(135deg, #007bff, #0056b3);
+                color: white;
+                align-self: flex-end;
+                border-bottom-right-radius: 6px;
+                box-shadow: 0 2px 8px rgba(0, 123, 255, 0.3);
+            }
+            
+            .bot-message {
+                background: rgba(255, 255, 255, 0.95);
+                backdrop-filter: blur(10px);
+                color: #333;
+                align-self: flex-start;
+                border-bottom-left-radius: 6px;
+                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+            }
+            
+            .typing-indicator {
+                display: none;
+                align-self: flex-start;
+                background: rgba(255, 255, 255, 0.95);
+                backdrop-filter: blur(10px);
+                padding: 12px 16px;
+                border-radius: 18px;
+                border-bottom-left-radius: 6px;
+                max-width: 85px;
+            }
+            
+            .typing-dots {
+                display: flex;
+                gap: 4px;
+            }
+            
+            .typing-dots span {
+                width: 8px;
+                height: 8px;
+                background: #666;
+                border-radius: 50%;
+                animation: typing 1.4s infinite ease-in-out;
+            }
+            
+            .typing-dots span:nth-child(2) {
+                animation-delay: 0.2s;
+            }
+            
+            .typing-dots span:nth-child(3) {
+                animation-delay: 0.4s;
+            }
+            
+            @keyframes typing {
+                0%, 60%, 100% {
+                    transform: translateY(0);
+                    opacity: 0.4;
+                }
+                30% {
+                    transform: translateY(-10px);
+                    opacity: 1;
+                }
+            }
+            
+            .input-container {
+                background: rgba(255, 255, 255, 0.95);
+                backdrop-filter: blur(10px);
+                padding: 16px 20px;
+                border-top: 1px solid rgba(0, 0, 0, 0.1);
+                display: flex;
+                gap: 12px;
+                align-items: flex-end;
+            }
+            
+            .input-wrapper {
+                flex: 1;
+                position: relative;
+            }
+            
+            .message-input {
+                width: 100%;
+                min-height: 44px;
+                max-height: 120px;
+                padding: 12px 16px;
+                border: 2px solid rgba(0, 0, 0, 0.1);
+                border-radius: 22px;
+                font-size: 14px;
+                font-family: inherit;
+                resize: none;
+                outline: none;
+                transition: all 0.2s ease;
+                background: white;
+            }
+            
+            .message-input:focus {
+                border-color: #007bff;
+                box-shadow: 0 0 0 3px rgba(0, 123, 255, 0.1);
+            }
+            
+            .message-input::placeholder {
+                color: #999;
+            }
+            
+            .send-button {
+                width: 44px;
+                height: 44px;
+                border: none;
+                border-radius: 50%;
+                background: linear-gradient(135deg, #007bff, #0056b3);
+                color: white;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                transition: all 0.2s ease;
+                box-shadow: 0 2px 8px rgba(0, 123, 255, 0.3);
+            }
+            
+            .send-button:hover:not(:disabled) {
+                transform: translateY(-1px);
+                box-shadow: 0 4px 12px rgba(0, 123, 255, 0.4);
+            }
+            
+            .send-button:disabled {
+                opacity: 0.5;
+                cursor: not-allowed;
+            }
+            
+            .send-button svg {
+                width: 20px;
+                height: 20px;
+            }
+            
+            .welcome-message {
+                text-align: center;
+                padding: 20px;
+                color: rgba(255, 255, 255, 0.9);
+                font-size: 16px;
+                font-weight: 500;
+            }
+            
+            .error-message {
+                background: linear-gradient(135deg, #dc3545, #c82333);
+                color: white;
+                align-self: flex-start;
+                border-bottom-left-radius: 6px;
+                box-shadow: 0 2px 8px rgba(220, 53, 69, 0.3);
+            }
+            
+            .retry-button {
+                background: rgba(255, 255, 255, 0.2);
+                border: 1px solid rgba(255, 255, 255, 0.3);
+                color: white;
+                padding: 6px 12px;
+                border-radius: 12px;
+                font-size: 12px;
+                cursor: pointer;
+                margin-top: 8px;
+                transition: all 0.2s ease;
+            }
+            
+            .retry-button:hover {
+                background: rgba(255, 255, 255, 0.3);
+            }
+            
+            @media (max-width: 400px) {
+                .message {
+                    max-width: 90%;
+                    font-size: 13px;
+                }
+                
+                .header {
+                    padding: 12px 16px;
+                }
+                
+                .input-container {
+                    padding: 12px 16px;
+                }
+                
+                .chat-container {
+                    padding: 16px;
+                }
+            }
         </style>
     </head>
     <body>
-        <div class="chat-container" id="chatContainer">
-            <div class="message bot-message">
-                Hello! I'm your navigation helper. How can I assist you today?
+        <div class="header">
+            <div class="bot-avatar">🤖</div>
+            <div class="header-info">
+                <h3>Navigation Helper</h3>
+                <div class="status">Online</div>
             </div>
         </div>
+        
+        <div class="chat-container" id="chatContainer">
+            <div class="welcome-message">
+                👋 Hello! I'm your navigation helper. How can I assist you today?
+            </div>
+        </div>
+        
+        <div class="typing-indicator" id="typingIndicator">
+            <div class="typing-dots">
+                <span></span>
+                <span></span>
+                <span></span>
+            </div>
+        </div>
+        
         <div class="input-container">
-            <input type="text" id="messageInput" placeholder="Type your message..." onkeypress="if(event.key==='Enter') sendMessage()">
-            <button onclick="sendMessage()">Send</button>
+            <div class="input-wrapper">
+                <textarea 
+                    id="messageInput" 
+                    class="message-input" 
+                    placeholder="Type your message..." 
+                    rows="1"
+                ></textarea>
+            </div>
+            <button class="send-button" id="sendButton" onclick="sendMessage()">
+                <svg viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M2,21L23,12L2,3V10L17,12L2,14V21Z" />
+                </svg>
+            </button>
         </div>
         
         <script>
+            const urlParams = new URLSearchParams(window.location.search);
+            const domain = urlParams.get('domain');
             let sessionId = Math.random().toString(36).substring(7);
+            let retryCount = 0;
+            const MAX_RETRIES = 3;
             
-            function sendMessage() {
-                const input = document.getElementById('messageInput');
-                const message = input.value.trim();
-                if (!message) return;
+            const chatContainer = document.getElementById('chatContainer');
+            const messageInput = document.getElementById('messageInput');
+            const sendButton = document.getElementById('sendButton');
+            const typingIndicator = document.getElementById('typingIndicator');
+            
+            // Auto-resize textarea
+            messageInput.addEventListener('input', function() {
+                this.style.height = 'auto';
+                this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+                sendButton.disabled = !this.value.trim();
+            });
+            
+            // Send message on Enter
+            messageInput.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    sendMessage();
+                }
+            });
+            
+            function addMessage(content, isUser = false, isError = false, showRetry = false) {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = `message ${isUser ? 'user-message' : (isError ? 'error-message' : 'bot-message')}`;
                 
-                const chatContainer = document.getElementById('chatContainer');
+                // Handle HTML content safely
+                if (typeof content === 'string') {
+                    messageDiv.textContent = content;
+                } else {
+                    messageDiv.innerHTML = content;
+                }
                 
-                // Add user message
-                chatContainer.innerHTML += '<div class="message user-message">' + message + '</div>';
+                if (showRetry && isError) {
+                    const retryBtn = document.createElement('button');
+                    retryBtn.className = 'retry-button';
+                    retryBtn.textContent = 'Retry';
+                    retryBtn.onclick = () => {
+                        const lastUserMessage = Array.from(chatContainer.children)
+                            .filter(el => el.classList.contains('user-message'))
+                            .pop();
+                        if (lastUserMessage) {
+                            sendMessage(lastUserMessage.textContent);
+                        }
+                    };
+                    messageDiv.appendChild(retryBtn);
+                }
                 
-                // Send to API
-                fetch('/api/chat', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({message: message, session_id: sessionId})
-                })
-                .then(response => response.json())
-                .then(data => {
-                    chatContainer.innerHTML += '<div class="message bot-message">' + data.response + '</div>';
-                    chatContainer.scrollTop = chatContainer.scrollHeight;
-                })
-                .catch(error => {
-                    chatContainer.innerHTML += '<div class="message bot-message">Sorry, there was an error processing your message.</div>';
-                    chatContainer.scrollTop = chatContainer.scrollHeight;
-                });
-                
-                input.value = '';
-                chatContainer.scrollTop = chatContainer.scrollHeight;
+                chatContainer.appendChild(messageDiv);
+                scrollToBottom();
+                return messageDiv;
             }
+            
+            function showTypingIndicator() {
+                chatContainer.appendChild(typingIndicator);
+                typingIndicator.style.display = 'block';
+                scrollToBottom();
+            }
+            
+            function hideTypingIndicator() {
+                typingIndicator.style.display = 'none';
+                if (typingIndicator.parentNode) {
+                    typingIndicator.parentNode.removeChild(typingIndicator);
+                }
+            }
+            
+            function scrollToBottom() {
+                setTimeout(() => {
+                    chatContainer.scrollTop = chatContainer.scrollHeight;
+                }, 100);
+            }
+            
+            async function sendMessage(messageText = null) {
+                const message = messageText || messageInput.value.trim();
+                if (!message || sendButton.disabled) return;
+                
+                sendButton.disabled = true;
+                messageInput.disabled = true;
+                
+                if (!messageText) {
+                    addMessage(message, true);
+                    messageInput.value = '';
+                    messageInput.style.height = 'auto';
+                }
+                
+                showTypingIndicator();
+                
+                try {
+                    const requestBody = {
+                        message: message,
+                        session_id: sessionId
+                    };
+                    
+                    if (domain) {
+                        requestBody.domain = domain;
+                    }
+                    
+                    const response = await fetch('/api/chat', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify(requestBody)
+                    });
+                    
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    
+                    const data = await response.json();
+                    
+                    hideTypingIndicator();
+                    addMessage(data.response || 'I apologize, but I encountered an issue processing your request.');
+                    retryCount = 0; // Reset retry count on success
+                    
+                } catch (error) {
+                    console.error('Error:', error);
+                    hideTypingIndicator();
+                    
+                    let errorMessage = 'Sorry, there was an error processing your message.';
+                    let showRetry = false;
+                    
+                    if (retryCount < MAX_RETRIES) {
+                        errorMessage += ' Please try again.';
+                        showRetry = true;
+                        retryCount++;
+                    } else {
+                        errorMessage += ' Please refresh the page and try again.';
+                    }
+                    
+                    addMessage(errorMessage, false, true, showRetry);
+                } finally {
+                    messageInput.disabled = false;
+                    messageInput.focus();
+                    sendButton.disabled = !messageInput.value.trim();
+                }
+            }
+            
+            // Initialize
+            document.addEventListener('DOMContentLoaded', function() {
+                messageInput.focus();
+                sendButton.disabled = true;
+                
+                // Send initial greeting if domain is provided
+                if (domain) {
+                    console.log('Widget loaded for domain:', domain);
+                }
+            });
         </script>
     </body>
     </html>
     """
+    
     return HTMLResponse(content=html_content)
-# --- RESTORED: get_knowledge_base endpoint ---
+
 @app.get("/api/knowledge-base")
 async def get_knowledge_base():
     """Get all documents metadata in knowledge base"""
@@ -907,8 +1401,6 @@ async def get_knowledge_base():
     except Exception as e:
          logger.error(f"Error fetching knowledge base metadata: {e}") # Added error log
          raise HTTPException(status_code=500, detail=f"Error fetching knowledge base metadata: {e}")
-# ---------------------------------------------
-
 
 @app.get("/api/sitemap")
 async def get_sitemap():
@@ -924,7 +1416,6 @@ async def get_sitemap():
     except Exception as e:
          logger.error(f"Error fetching sitemap: {e}") # Added error log
          raise HTTPException(status_code=500, detail=f"Error fetching sitemap: {e}")
-
 
 @app.delete("/api/knowledge-base")
 async def clear_knowledge_base():
@@ -959,7 +1450,6 @@ async def clear_knowledge_base():
     except Exception as e:
         logger.error(f"Error clearing knowledge base: {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
-
 
 @app.get("/api/status")
 async def get_status():
@@ -1023,7 +1513,5 @@ async def get_status():
     }
 
 if __name__ == "__main__":
-    # Ensure the chroma directory exists for persistence
     os.makedirs(CHROMA_DB_PATH, exist_ok=True)
-    # The RAG system is initialized on app startup via @app.on_event("startup")
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) # Listen on 0.0.0.0 for external access if needed
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 
