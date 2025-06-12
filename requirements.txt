@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+pydantic
+requests
+beautifulsoup4
+pypdf # For PDF loading
+python-docx # For DOCX loading
+langchain
+langchain-openai # Or langchain-community for other LLMs
+chromadb # For the vector database
+tiktoken # Often needed by OpenAI models
+python-dotenv # For loading API key from .env

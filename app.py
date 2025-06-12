@@ -160,7 +160,7 @@ def step1_upload_sources():
                         st.session_state.uploaded_files = result.get('uploaded_files', [])
                         st.markdown(f"""
                         <div class="success-box">
-                        ✅ Successfully uploaded {result.get('count', 0)} documents!
+                        ✅ Successfully uploaded documents!
                         </div>
                         """, unsafe_allow_html=True)
                         time.sleep(1)
@@ -321,13 +321,13 @@ def step4_try_it_out():
             for chat in st.session_state.chat_history:
                 if chat["role"] == "user":
                     st.markdown(f"""
-                    <div style="background: #007bff; color: white; padding: 10px; border-radius: 10px; margin: 5px 0; text-align: right;">
+                    <div style="padding: 10px; border-radius: 10px; margin: 5px 0; text-align: right;">
                     {chat["message"]}
                     </div>
                     """, unsafe_allow_html=True)
                 else:
                     st.markdown(f"""
-                    <div style="background: #f8f9fa; border: 1px solid #ddd; padding: 10px; border-radius: 10px; margin: 5px 0;">
+                    <div style="padding: 10px; border-radius: 10px; margin: 5px 0;">
                     {chat["message"]}
                     </div>
                     """, unsafe_allow_html=True)
