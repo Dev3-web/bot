@@ -1837,5 +1837,8 @@ async def get_status():
     }
 
 if __name__ == "__main__":
+    import os
+
     os.makedirs(CHROMA_DB_PATH, exist_ok=True)
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 
+    port = int(os.environ.get("PORT", 8000))  # use 8000 as fallback locally
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
