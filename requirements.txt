@@ -6,11 +6,13 @@ beautifulsoup4
 pypdf
 python-docx
 langchain
-langchain-openai  # Use langchain-community if not using OpenAI
+langchain-community
+langchain-openai
 chromadb
 tiktoken
 python-dotenv
-PyPDF2  # For advanced PDF support
-python-multipart  # Required for file uploads with FastAPI
+PyPDF2
+python-multipart
 streamlit
 pandas
+openai
