@@ -12,6 +12,8 @@ from datetime import datetime
 import time
 import base64
 from io import BytesIO
+import re
+from typing import List, Dict, Set
 import sqlite3
 
 # Configure Streamlit page
@@ -78,13 +80,13 @@ def make_api_request(endpoint, method="GET", data=None, files=None):
         url = f"{API_BASE_URL}{endpoint}"
         
         if method == "GET":
-            response = requests.get(url, timeout=30)
+            response = requests.get(url, timeout=60)
         elif method == "POST":
             if files:
-                response = requests.post(url, files=files, data=data, timeout=30)
+                response = requests.post(url, files=files, data=data, timeout=60)
             else:
                 headers = {'Content-Type': 'application/json'}
-                response = requests.post(url, json=data, headers=headers, timeout=30)
+                response = requests.post(url, json=data, headers=headers, timeout=60)
         
         # Check if request was successful
         if response.status_code == 200:
@@ -98,9 +100,6 @@ def make_api_request(endpoint, method="GET", data=None, files=None):
             
     except requests.exceptions.ConnectionError:
         st.error("❌ Cannot connect to backend. Make sure the backend is running on http://localhost:8000")
-        return None
-    except requests.exceptions.Timeout:
-        st.error("❌ Request timed out. Please try again.")
         return None
     except requests.exceptions.RequestException as e:
         st.error(f"❌ API Error: {str(e)}")
@@ -206,7 +205,7 @@ def step2_generate_sitemap():
             if result:
                 st.markdown(f"""
                 <div class="success-box">
-                ✅ Sitemap generated successfully! Found {result.get('pages_found', 0)} pages.
+                Sitemap generated successfully!
                 </div>
                 """, unsafe_allow_html=True)
                 st.session_state.bot_config['domain'] = domain
@@ -226,72 +225,128 @@ def step2_generate_sitemap():
             st.rerun()
 
 def step3_set_goals():
-    """Step 3: Define target outcomes and goals"""
+    """Step 3: Define target outcomes and goals (with dynamic multi-goal support)"""
     st.markdown('<div class="step-header"><h2>🎯 Step 3: Set Target Outcomes</h2></div>', unsafe_allow_html=True)
-    
+
     st.markdown("""
     <div class="info-box">
-    <strong>What this does:</strong> Define specific goals your bot should help users achieve. 
-    This makes the bot more proactive in guiding users.
+    <strong>What this does:</strong> Select suggested goals or add multiple custom goals that your bot should help users achieve.
     </div>
     """, unsafe_allow_html=True)
+
+    # --- STATE INITIALIZATION ---
+    # Initialize state for suggested goal checkboxes
+    if 'goal_states' not in st.session_state:
+        suggested_goals = st.session_state.get('suggested_goals', [])
+        st.session_state.goal_states = {goal: True for goal in suggested_goals}
     
+    # Initialize state for the list of custom goals
+    if 'custom_goals' not in st.session_state:
+        st.session_state.custom_goals = []
+
+    # --- CALLBACK FUNCTION TO ADD A CUSTOM GOAL ---
+    def add_custom_goal():
+        """Adds the content of the text_input to the custom_goals list."""
+        goal_text = st.session_state.get("custom_goal_input", "").strip()
+        if goal_text and goal_text not in st.session_state.custom_goals:
+            st.session_state.custom_goals.append(goal_text)
+            # Clear the input box after adding
+            st.session_state.custom_goal_input = ""
+
+    # --- UI LAYOUT ---
     col1, col2 = st.columns(2)
     
     with col1:
-        st.subheader("🎯 Primary Goals")
-        goal1 = st.checkbox("Guide users to upload documents", value=True)
-        goal2 = st.checkbox("Help users use Q&A feature", value=True)
-        goal3 = st.checkbox("Collect customer contact information", value=True)
-        goal4 = st.checkbox("Guide users through platform features")
-        goal5 = st.checkbox("Provide technical support")
-    
+        # --- SUGGESTED GOALS ---
+        st.subheader("🎯 Suggested Goals")
+        suggested_goals = st.session_state.get('suggested_goals', [])
+        if suggested_goals:
+            for goal in suggested_goals:
+                st.session_state.goal_states[goal] = st.checkbox(
+                    goal, 
+                    value=st.session_state.goal_states.get(goal, True),
+                    key=f"goal_{goal}"
+                )
+        else:
+            st.info("No specific goals were automatically identified from the website.")
+        
+        # --- CUSTOM GOALS INPUT ---
+        st.subheader("➕ Add Custom Goals")
+        st.text_input(
+            "Enter a new goal and press Enter", 
+            key="custom_goal_input", 
+            on_change=add_custom_goal,
+            placeholder="e.g., Book a consultation"
+        )
+        st.button("Add Goal", on_click=add_custom_goal)
+
+        # --- DISPLAY CURRENT CUSTOM GOALS WITH DELETE OPTION ---
+        if st.session_state.custom_goals:
+            st.write("Your custom goals:")
+            # We iterate in reverse to safely delete items without index errors
+            for i in range(len(st.session_state.custom_goals) - 1, -1, -1):
+                goal_item = st.session_state.custom_goals[i]
+                row_col1, row_col2 = st.columns([0.85, 0.15])
+                with row_col1:
+                    st.write(f"• {goal_item}")
+                with row_col2:
+                    if st.button("🗑️", key=f"delete_custom_{i}", help=f"Delete goal: {goal_item}"):
+                        st.session_state.custom_goals.pop(i)
+                        st.rerun() # Force an immediate rerun to update the list display
+
     with col2:
+        # --- BOT CONFIGURATION ---
         st.subheader("⚙️ Bot Configuration")
         widget_position = st.selectbox(
             "Widget Position",
             ["bottom-right", "bottom-left", "top-right", "top-left"],
             index=0
         )
-        
         widget_color = st.color_picker("Widget Color", "#007bff")
-        
-        custom_goal = st.text_input("Add Custom Goal", placeholder="e.g., Schedule a demo")
-    
-    # Collect selected goals
-    goals = []
-    if goal1: goals.append("upload_documents")
-    if goal2: goals.append("qa_feature") 
-    if goal3: goals.append("collect_contact")
-    if goal4: goals.append("platform_guide")
-    if goal5: goals.append("technical_support")
-    if custom_goal: goals.append(custom_goal)
-    
+
+    # --- FINAL GOAL COMPILATION AND PREVIEW ---
+    st.divider()
     st.subheader("📝 Selected Goals Preview")
-    if goals:
-        for i, goal in enumerate(goals, 1):
-            st.write(f"{i}. {goal.replace('_', ' ').title()}")
     
-    if st.button("Save Configuration", key="save_config"):
-        config_data = {
-            "domain": st.session_state.bot_config.get('domain', ''),
-            "widget_position": widget_position,
-            "widget_color": widget_color,
-            "goals": goals
-        }
-        
-        result = make_api_request("/api/configure-bot", "POST", config_data)
-        
-        if result:
-            st.session_state.bot_config.update(config_data)
-            st.markdown("""
-            <div class="success-box">
-            ✅ Bot configuration saved successfully!
-            </div>
-            """, unsafe_allow_html=True)
-            time.sleep(1)
-            st.session_state.current_step = 4
-            st.rerun()
+    # Collect all selected goals
+    final_goals = []
+    # 1. Add selected suggested goals
+    for goal, is_selected in st.session_state.get('goal_states', {}).items():
+        if is_selected:
+            final_goals.append(goal)
+    # 2. Add all custom goals
+    final_goals.extend(st.session_state.custom_goals)
+    
+    if final_goals:
+        for i, goal in enumerate(final_goals, 1):
+            st.markdown(f"`{i}.` {goal}")
+    else:
+        st.warning("No goals have been selected or added.")
+    
+    # --- SAVE BUTTON ---
+    if st.button("Save Configuration & Continue", key="save_config"):
+        if not final_goals:
+            st.error("Please select or add at least one goal before saving.")
+        else:
+            config_data = {
+                "domain": st.session_state.bot_config.get('domain', ''),
+                "widget_position": widget_position,
+                "widget_color": widget_color,
+                "goals": final_goals # Use the dynamically compiled list
+            }
+            
+            result = make_api_request("/api/configure-bot", "POST", config_data)
+            
+            if result:
+                st.session_state.bot_config.update(config_data)
+                st.markdown("""
+                <div class="success-box">
+                ✅ Bot configuration saved successfully!
+                </div>
+                """, unsafe_allow_html=True)
+                time.sleep(1)
+                st.session_state.current_step = 4
+                st.rerun()
 
 def step4_try_it_out():
     """Step 4: Try it out section"""
@@ -462,7 +517,20 @@ def step6_deploy_widget():
     if not domain:
         st.error("Please complete previous steps first.")
         return
+
+    # Fetch sitemap to populate page selection
+    sitemap_data = make_api_request("/api/sitemap")
+    page_options = ["All pages"] # Default option
     
+    if sitemap_data and sitemap_data.get('sitemap'):
+        # Extract URLs from the sitemap data
+        # Assuming the sitemap returns a list of dictionaries with a 'url' key
+        pages = [item['url'] for item in sitemap_data['sitemap']]
+        page_options.extend(pages)
+    else:
+        # Show a warning if sitemap couldn't be fetched
+        st.warning("Could not fetch your website's sitemap. Please ensure it was generated correctly in Step 2. Only the 'All pages' option is available.")
+
     # Widget positioning options
     st.subheader("📍 Widget Positioning")
     
@@ -475,22 +543,17 @@ def step6_deploy_widget():
             index=0
         )
         
-        pages_to_show = st.multiselect(
-            "Select pages where widget should appear",
-            ["All pages", "Home page", "Contact page", "About page", "Product pages", "Blog posts"],
-            default=["All pages"]
+        widget_size = st.selectbox(
+            "Widget size",
+            ["Compact (300x400)", "Standard (350x500)", "Large (400x600)"]
         )
+        
     
     with col2:
         trigger_behavior = st.selectbox(
             "Widget trigger behavior",
             ["Always visible", "Show after 5 seconds", "Show on scroll", "Show on exit intent"]
-        )
-        
-        widget_size = st.selectbox(
-            "Widget size",
-            ["Compact (300x400)", "Standard (350x500)", "Large (400x600)"]
-        )
+        )        
     
     # Generate widget code
     if st.button("Generate Widget Code", key="generate_widget"):
@@ -597,7 +660,7 @@ def dashboard_analytics():
 def test_backend_connection():
     """Test if backend is running"""
     try:
-        response = requests.get(f"{API_BASE_URL}/", timeout=5)
+        response = requests.get(f"{API_BASE_URL}/", timeout=30)
         return response.status_code == 200
     except:
         return False
