@@ -1,12 +1,16 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pydantic
 requests
 beautifulsoup4
-pypdf # For PDF loading
-python-docx # For DOCX loading
+pypdf
+python-docx
 langchain
-langchain-openai # Or langchain-community for other LLMs
-chromadb # For the vector database
-tiktoken # Often needed by OpenAI models
-python-dotenv # For loading API key from .env
+langchain-openai  # Use langchain-community if not using OpenAI
+chromadb
+tiktoken
+python-dotenv
+PyPDF2  # For advanced PDF support
+python-multipart  # Required for file uploads with FastAPI
+streamlit
+pandas
