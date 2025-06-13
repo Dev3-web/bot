@@ -1838,5 +1838,4 @@ async def get_status():
 
 if __name__ == "__main__":
     os.makedirs(CHROMA_DB_PATH, exist_ok=True)
-    PORT = 8000
-    uvicorn.run("main:app", port=PORT)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 
