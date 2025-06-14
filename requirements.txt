@@ -17,3 +17,4 @@ streamlit
 pandas
 openai
 firecrawl-py
+playwright
