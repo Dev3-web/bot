@@ -80,13 +80,13 @@ def make_api_request(endpoint, method="GET", data=None, files=None):
         url = f"{API_BASE_URL}{endpoint}"
         
         if method == "GET":
-            response = requests.get(url, timeout=60)
+            response = requests.get(url, timeout=100)
         elif method == "POST":
             if files:
-                response = requests.post(url, files=files, data=data, timeout=60)
+                response = requests.post(url, files=files, data=data, timeout=100)
             else:
                 headers = {'Content-Type': 'application/json'}
-                response = requests.post(url, json=data, headers=headers, timeout=60)
+                response = requests.post(url, json=data, headers=headers, timeout=100)
         
         # Check if request was successful
         if response.status_code == 200:
@@ -545,7 +545,7 @@ def step6_deploy_widget():
         
         widget_size = st.selectbox(
             "Widget size",
-            ["Compact (300x400)", "Standard (350x500)", "Large (400x600)"]
+            ["Compact (200x200)", "Standard (350x500)", "Large (400x600)"]
         )
         
     
