@@ -14,6 +14,7 @@ from contextlib import contextmanager
 import re
 from urllib.parse import urljoin, urlparse, unquote, urlunparse
 from bs4 import BeautifulSoup
+from collections import deque
 import PyPDF2
 import docx
 import io
@@ -27,6 +28,8 @@ from urllib3.util.retry import Retry
 import re
 import asyncio
 from playwright.async_api import async_playwright, Browser, Page
+import gc
+from pathlib import Path
 
 # --- Langchain / RAG Imports ---
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
@@ -48,10 +51,10 @@ load_dotenv() # Load environment variables from .env file
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     logger.error("OPENAI_API_KEY environment variable not set!")
-    
+
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
 if not FIRECRAWL_API_KEY:
-    logger.error("FIRECRAWL_API_KEY environment variable not set!")    
+    logger.error("FIRECRAWL_API_KEY environment variable not set!")
 
 
 # Configure logging
@@ -71,6 +74,9 @@ app.add_middleware(
 
 # --- Database Setup (for metadata and logs) ---
 DATABASE_FILE = "nav_bot.db"
+chroma_client = None
+rag_chain = None
+CHROMA_DB_PATH = "./chroma_db"
 
 def suggest_goals_from_content(sitemap_data: List[Dict]) -> List[str]:
     """
@@ -97,7 +103,6 @@ def suggest_goals_from_content(sitemap_data: List[Dict]) -> List[str]:
         if any(re.search(r'\b' + re.escape(keyword) + r'\b', full_text) for keyword in keywords):
             found_goals.add(goal)
     return sorted(list(found_goals))[:8]
-
 
 def init_database():
     """Initialize SQLite database with required tables"""
@@ -177,10 +182,6 @@ def get_db_connection():
         yield conn
     finally:
         conn.close()
-
-# --- RAG System Setup ---
-CHROMA_DB_PATH = "./chroma_db"
-rag_chain = None # Global variable to hold the RAG chain
 
 def initialize_rag_system():
     """Initializes the Langchain RAG components."""
@@ -305,97 +306,146 @@ def add_document_to_rag(file_content: bytes, filename: str, file_type: str):
              os.remove(temp_filepath)
         return False
 
-# --- Helper functions (kept from original, slightly modified or used differently) ---
+def add_website_content_to_rag(sitemap_data: List[Dict]):
+    """
+    Processes crawled website data, splits it, and adds it to the RAG vector store.
+    """
+    if not rag_chain:
+        logger.warning("RAG system not initialized. Cannot add website content.")
+        return 0
+
+    if not sitemap_data:
+        logger.warning("No sitemap data provided to add to RAG.")
+        return 0
+
+    logger.info(f"Preparing to add content from {len(sitemap_data)} crawled pages to RAG system.")
+
+    # 1. Convert crawled data into Langchain Document objects
+    langchain_docs = []
+    for page in sitemap_data:
+        # We must have content to process
+        if page.get('content') and page.get('url'):
+            # Create a Document with the page content and the URL as metadata
+            # The metadata is crucial for providing sources and context
+            doc = Document(
+                page_content=page['content'],
+                metadata={
+                    "source": page['url'],
+                    "title": page.get('title', 'Untitled')
+                }
+            )
+            langchain_docs.append(doc)
+
+    if not langchain_docs:
+        logger.warning("No valid content found in sitemap data to add to RAG.")
+        return 0
+
+    # 2. Split the documents into smaller chunks for better embedding and retrieval
+    logger.info(f"Splitting {len(langchain_docs)} documents into chunks...")
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    split_docs = text_splitter.split_documents(langchain_docs)
+    logger.info(f"Split into {len(split_docs)} chunks.")
+
+    if not split_docs:
+        logger.warning("No text chunks were generated from the website content.")
+        return 0
+
+    # 3. Add the document chunks to the Chroma vector store
+    try:
+        embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+        vectorstore = Chroma(persist_directory=CHROMA_DB_PATH, embedding_function=embeddings)
+        
+        logger.info(f"Adding {len(split_docs)} website content chunks to Chroma DB...")
+        vectorstore.add_documents(split_docs)
+        logger.info("Website content chunks added to RAG successfully.")
+        
+        return len(split_docs) # Return the number of chunks added
+
+    except Exception as e:
+        logger.error(f"Error adding website content to RAG: {e}")
+        return 0
 
 def generate_file_hash(content: bytes) -> str:
     """Generate SHA-256 hash of file content"""
     return hashlib.sha256(content).hexdigest()
 
-async def crawl_with_playwright(url: str, max_pages: int = 25) -> List[Dict]:
+async def crawl_with_playwright(url: str, max_pages: int = 25, concurrency: int = 10) -> List[Dict]:
     """
-    Crawls a website using Playwright and formats the output.
+    Crawls a website in parallel using Playwright and asyncio.
     """
-    # Ensure URL has proper protocol
     if not url.startswith(('http://', 'https://')):
         url = f'https://{url}'
 
-    logger.info(f"Starting Playwright crawl for URL: {url} with a limit of {max_pages} pages.")
-    
+    logger.info(f"Starting PARALLEL Playwright crawl for URL: {url} with concurrency {concurrency}.")
+
     crawled_pages = []
-    visited_urls = set()
-    urls_to_visit = [url]
+    urls_to_visit = deque([url])
+    visited_urls = {url}
     base_domain = urlparse(url).netloc
-    
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         
-        try:
-            for depth in range(3):  # Max depth of 3
-                if not urls_to_visit or len(crawled_pages) >= max_pages:
-                    break
-                    
-                current_level_urls = urls_to_visit.copy()
-                urls_to_visit = []
-                
-                for current_url in current_level_urls:
-                    if len(crawled_pages) >= max_pages:
-                        break
-                        
-                    if current_url in visited_urls:
-                        continue
-                        
-                    try:
-                        page_data = await scrape_page(browser, current_url, depth)
-                        if page_data:
-                            crawled_pages.append(page_data)
-                            visited_urls.add(current_url)
-                            
-                            # Extract links for next level
-                            if depth < 2:  # Only extract links if we haven't reached max depth
-                                links = await extract_links(browser, current_url, base_domain)
-                                for link in links:
-                                    if link not in visited_urls and link not in urls_to_visit:
-                                        urls_to_visit.append(link)
-                                        
-                    except Exception as e:
-                        logger.warning(f"Error scraping {current_url}: {e}")
-                        continue
-                        
-        finally:
-            await browser.close()
-    
-    logger.info(f"Crawling completed. Found {len(crawled_pages)} pages.")
-    print("total crawled pages:", crawled_pages)
-    return crawled_pages
+        while urls_to_visit and len(crawled_pages) < max_pages:
+            # Create a batch of tasks to run in parallel
+            tasks = []
+            batch_size = min(len(urls_to_visit), concurrency, max_pages - len(crawled_pages))
+            
+            for _ in range(batch_size):
+                current_url = urls_to_visit.popleft()
+                # Create a task to scrape one page and find its links
+                tasks.append(scrape_and_find_links(browser, current_url, base_domain))
 
+            # Run the batch of tasks concurrently
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Process the results of the batch
+            for res in results:
+                if isinstance(res, Exception) or not res:
+                    continue # Skip failed crawls
+                
+                page_data, new_links = res
+                if page_data and page_data['url'] not in [p['url'] for p in crawled_pages]:
+                    crawled_pages.append(page_data)
+
+                # Add newly found, unvisited links to the queue
+                for link in new_links:
+                    if link not in visited_urls:
+                        visited_urls.add(link)
+                        urls_to_visit.append(link)
+        
+        await browser.close()
+
+    logger.info(f"Parallel crawling completed. Found {len(crawled_pages)} pages.")
+    return crawled_pages
 
 async def scrape_page(browser: Browser, url: str, depth: int = 0) -> Dict:
     """
     Scrape a single page using Playwright.
     """
     page = await browser.new_page()
-    
+
     try:
         # Set user agent to avoid bot detection
         await page.set_extra_http_headers({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         })
-        
+
         # Navigate to page with timeout
         await page.goto(url, wait_until='domcontentloaded', timeout=20000)
-        
+
         # Wait for content to load
         await page.wait_for_timeout(20000)
-        
+
         # Extract page title
         title = await page.title()
-        
+
         # Extract main content
         content = await extract_main_content(page)
-        
+
         # Get page URL (in case of redirects)
         final_url = page.url
-        
+
         return {
             'url': final_url,
             'title': title or 'Untitled',
@@ -403,14 +453,29 @@ async def scrape_page(browser: Browser, url: str, depth: int = 0) -> Dict:
             'depth': depth,
             'parent_url': None  # You can track parent URLs if needed
         }
-        
+
     except Exception as e:
         logger.error(f"Error scraping page {url}: {e}")
         return None
-        
+
     finally:
         await page.close()
-
+        
+async def scrape_and_find_links(browser: Browser, url: str, base_domain: str):
+    """A helper task that scrapes a page and finds links on it."""
+    try:
+        # Reuse your existing scraping logic
+        page_data = await scrape_page(browser, url, 0) # Depth can be managed if needed
+        if not page_data:
+            return None, []
+        
+        # Reuse your existing link extraction logic
+        new_links = await extract_links(browser, url, base_domain)
+        
+        return page_data, new_links
+    except Exception as e:
+        logger.warning(f"Error in worker for {url}: {e}")
+        return None, []
 
 async def extract_main_content(page: Page) -> str:
     """
@@ -428,9 +493,9 @@ async def extract_main_content(page: Page) -> str:
             '.post-content',
             '.entry-content'
         ]
-        
+
         content_text = ""
-        
+
         # Try each selector to find main content
         for selector in main_selectors:
             try:
@@ -441,7 +506,7 @@ async def extract_main_content(page: Page) -> str:
                         break
             except:
                 continue
-        
+
         # If no main content found, get body content and filter
         if not content_text or len(content_text.strip()) < 100:
             # Get all text content
@@ -450,26 +515,25 @@ async def extract_main_content(page: Page) -> str:
                     // Remove script and style elements
                     const scripts = document.querySelectorAll('script, style, nav, header, footer, aside, .nav, .navigation, .menu, .sidebar');
                     scripts.forEach(el => el.remove());
-                    
+
                     // Get body text
                     return document.body.innerText || document.body.textContent || '';
                 }
             ''')
-        
+
         # Clean up the content
         content_text = clean_content(content_text)
-        
+
         # Limit content length to avoid huge texts
         if len(content_text) > 5000:
             content_text = content_text[:5000] + "..."
-            
-        print("Content extracted:", content_text) 
+
+        print("Content extracted:", content_text)
         return content_text
-        
+
     except Exception as e:
         logger.error(f"Error extracting content: {e}")
         return ""
-
 
 async def extract_links(browser: Browser, url: str, base_domain: str) -> List[str]:
     """
@@ -477,32 +541,31 @@ async def extract_links(browser: Browser, url: str, base_domain: str) -> List[st
     """
     page = await browser.new_page()
     links = []
-    
+
     try:
         await page.goto(url, wait_until='domcontentloaded', timeout=20000)
-        
+
         # Extract all links
         link_elements = await page.query_selector_all('a[href]')
-        
+
         for link_element in link_elements:
             href = await link_element.get_attribute('href')
             if href:
                 # Convert relative URLs to absolute
                 absolute_url = urljoin(url, href)
-                
+
                 # Check if link is internal and valid
                 if is_valid_internal_link(absolute_url, base_domain):
                     links.append(absolute_url)
-                    
+
     except Exception as e:
         logger.error(f"Error extracting links from {url}: {e}")
-        
+
     finally:
         await page.close()
-    
+
     print("Extracted links:", links)
     return list(set(links))  # Remove duplicates
-
 
 def is_valid_internal_link(url: str, base_domain: str) -> bool:
     """
@@ -510,32 +573,31 @@ def is_valid_internal_link(url: str, base_domain: str) -> bool:
     """
     try:
         parsed = urlparse(url)
-        
+
         # Must be same domain
         if parsed.netloc != base_domain:
             return False
-            
+
         # Skip certain file types and paths
         excluded_extensions = ['.pdf', '.jpg', '.jpeg', '.png', '.gif', '.css', '.js', '.xml', '.zip']
         excluded_paths = ['/feed/', '/rss/', '/admin/', '/wp-admin/', '/wp-content/', '/wp-includes/']
-        
+
         path = parsed.path.lower()
-        
+
         # Check extensions
         for ext in excluded_extensions:
             if path.endswith(ext):
                 return False
-                
+
         # Check paths
         for excluded_path in excluded_paths:
             if excluded_path in path:
                 return False
-                
+
         return True
-        
+
     except Exception:
         return False
-
 
 def clean_content(text: str) -> str:
     """
@@ -543,21 +605,20 @@ def clean_content(text: str) -> str:
     """
     if not text:
         return ""
-        
+
     # Remove extra whitespace
     text = re.sub(r'\s+', ' ', text)
-    
+
     # Remove common unwanted patterns
     text = re.sub(r'Skip to.*?content', '', text, flags=re.IGNORECASE)
     text = re.sub(r'Cookie.*?policy', '', text, flags=re.IGNORECASE)
     text = re.sub(r'Privacy.*?policy', '', text, flags=re.IGNORECASE)
-    
+
     # Remove multiple consecutive periods or dashes
     text = re.sub(r'[.]{3,}', '...', text)
     text = re.sub(r'[-]{3,}', '---', text)
-    
-    return text.strip()
 
+    return text.strip()
 
 def generate_goals_with_ai(crawled_data: List[Dict]) -> List[str]:
     """
@@ -570,7 +631,7 @@ def generate_goals_with_ai(crawled_data: List[Dict]) -> List[str]:
     if not crawled_data:
         logger.warning("No crawled data provided to generate goals.")
         return []
-    
+
     logger.info("Generating user goals with AI...")
 
     # Combine content from the first few pages to create a context for the LLM
@@ -606,7 +667,7 @@ def generate_goals_with_ai(crawled_data: List[Dict]) -> List[str]:
         # Use the ChatOpenAI model for the completion
         llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2, openai_api_key=OPENAI_API_KEY)
         response = llm.invoke(prompt)
-        
+
         # The response content will be in response.content for Chat Models
         raw_goals = response.content.strip()
 
@@ -617,7 +678,7 @@ def generate_goals_with_ai(crawled_data: List[Dict]) -> List[str]:
             for line in raw_goals.split('\n')
             if line.strip()
         ]
-        
+
         logger.info(f"AI suggested goals: {goals}")
         return goals[:8] # Return up to 8 goals
 
@@ -625,6 +686,62 @@ def generate_goals_with_ai(crawled_data: List[Dict]) -> List[str]:
         logger.error(f"Error calling OpenAI to generate goals: {e}")
         return []
 
+async def cleanup_chroma_db(chroma_db_path: str, max_retries: int = 3) -> bool:
+    """
+    Robust ChromaDB cleanup function that tries multiple approaches.
+    Returns True if successful, False otherwise.
+    """
+    global chroma_client
+    
+    # Close any existing connections
+    if chroma_client:
+        try:
+            if hasattr(chroma_client, 'close'):
+                chroma_client.close()
+        except:
+            pass
+        chroma_client = None
+    
+    gc.collect()
+    
+    path = Path(chroma_db_path)
+    if not path.exists():
+        return True
+    
+    for attempt in range(max_retries):
+        try:
+            if attempt == 0:
+                # Direct removal
+                shutil.rmtree(path)
+                return True
+            elif attempt == 1:
+                # Individual file removal
+                for file_path in path.rglob("*"):
+                    if file_path.is_file():
+                        file_path.unlink(missing_ok=True)
+                for dir_path in sorted(path.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+                    if dir_path.is_dir():
+                        try:
+                            dir_path.rmdir()
+                        except OSError:
+                            pass
+                if path.exists():
+                    path.rmdir()
+                return True
+            else:
+                # Rename method
+                backup_name = f"{chroma_db_path}_backup_{int(time.time())}"
+                path.rename(backup_name)
+                path.mkdir(parents=True, exist_ok=True)
+                return True
+                
+        except Exception as e:
+            logger.warning(f"ChromaDB cleanup attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1)
+                gc.collect()
+    
+    return False
 class ChatMessage(BaseModel):
     message: str
     session_id: str
@@ -635,7 +752,6 @@ class CustomerInfo(BaseModel):
     email: Optional[str] = None
     phone: Optional[str] = None
     additional_info: Optional[str] = None
-
 class BotConfig(BaseModel):
     domain: str
     widget_position: str = "bottom-right"
@@ -653,7 +769,6 @@ class SitemapRequest(BaseModel):
 
 
 # --- API Routes ---
-
 @app.on_event("startup")
 async def startup_event():
     """Initialize database and RAG system on startup"""
@@ -667,7 +782,6 @@ async def shutdown_event():
     if os.path.exists(temp_dir):
         logger.info(f"Cleaning up temporary directory: {temp_dir}")
         shutil.rmtree(temp_dir)
-    # Note: ChromaDB handles persistence itself, no explicit shutdown needed usually
 
 @app.get("/")
 async def root():
@@ -772,6 +886,8 @@ async def generate_sitemap(request: SitemapRequest):
     logger.info(f"Starting sitemap and goal generation for domain: {domain}")
 
     try:
+        # await clear_knowledge_base()
+        logger.info("Cleared previous knowledge base to prepare for new crawl data.")
         # Step 1: Crawl the website using Playwright
         sitemap_data = await crawl_with_playwright(domain, max_pages=110)
         logger.info(f"Finished crawling. Found {len(sitemap_data)} pages.")
@@ -779,21 +895,30 @@ async def generate_sitemap(request: SitemapRequest):
         if not sitemap_data:
             # More specific error handling
             logger.warning(f"No pages found for domain: {domain}")
-            
+
             # Try to provide more helpful error information
             if not domain.startswith(('http://', 'https://')):
                 test_url = f'https://{domain}'
             else:
                 test_url = domain
-                
+
             raise HTTPException(
                 status_code=404,
                 detail=f"No pages found for {domain}. Please check if the website is accessible at {test_url} and allows crawling."
             )
-
+            
         # Step 2: Generate goal suggestions using AI
         logger.info("data ----------------------------", sitemap_data)
+        chunks_added_to_rag = add_website_content_to_rag(sitemap_data)
+        if chunks_added_to_rag > 0:
+            logger.info(f"Successfully added {chunks_added_to_rag} content chunks to the RAG vector store.")
+        else:
+            logger.warning("Could not add any website content to the RAG system.")
         suggested_goals = generate_goals_with_ai(sitemap_data)
+        if not suggested_goals:
+            logger.warning("AI goal generation failed. Falling back to keyword-based suggestions.")
+            suggested_goals = suggest_goals_from_content(sitemap_data)
+        logger.info(f"Final suggested goals: {suggested_goals}")
         
         # Fallback to keyword-based suggestions if AI fails or returns nothing
         if not suggested_goals:
@@ -811,14 +936,14 @@ async def generate_sitemap(request: SitemapRequest):
                 try:
                     cursor.execute(
                         "INSERT INTO sitemap (url, title, content, parent_url, depth) VALUES (?, ?, ?, ?, ?)",
-                        (page['url'], page['title'], page['content'], 
+                        (page['url'], page['title'], page['content'],
                          page.get('parent_url'), page.get('depth', 0))
                     )
                     inserted_count += 1
                 except Exception as db_error:
                     logger.warning(f"Failed to insert page {page.get('url', 'unknown')}: {db_error}")
                     continue
-            
+
             conn.commit()
             logger.info(f"Inserted {inserted_count} new sitemap entries into DB.")
 
@@ -826,6 +951,7 @@ async def generate_sitemap(request: SitemapRequest):
             "message": "Sitemap generated and goals suggested successfully",
             "pages_found": len(sitemap_data),
             "pages_saved_to_db": inserted_count,
+            "chunks_added_to_rag": chunks_added_to_rag, 
             "suggested_goals": suggested_goals
         }
 
@@ -904,19 +1030,14 @@ async def configure_bot(config: BotConfig):
 @app.post("/api/verify-dns")
 async def verify_dns(verification: DNSVerification):
     """Verify DNS record for domain (basic check)"""
-    domain = verification.domain.replace('http://', '').replace('https://', '').split('/')[0] # Clean up domain
+    domain = verification.domain.replace('http://', '').replace('https://', '').split('/')[0] 
     logger.info(f"Attempting to verify domain: {domain}")
-    # Basic verification - try to access the domain over HTTPS
-    # A proper DNS verification might involve checking for a specific TXT record
     try:
-        # Use a HEAD request which is lighter than GET
-        response = requests.head(f"https://{domain}", timeout=15, verify=True) # Add verify=True for SSL checks
+        response = requests.head(f"https://{domain}", timeout=15, verify=True)
 
-        # Consider success codes (2xx) and potentially redirects (3xx)
         if 200 <= response.status_code < 400:
             with get_db_connection() as conn:
                 cursor = conn.cursor()
-                # Ensure a config exists for this domain before updating
                 cursor.execute("SELECT id FROM bot_config WHERE domain = ?", (domain,))
                 if cursor.fetchone():
                     cursor.execute("""
@@ -946,11 +1067,11 @@ async def verify_dns(verification: DNSVerification):
 async def get_widget_code(request: WidgetRequest):
     """Generate widget code for integration"""
     domain = request.domain
-    
+
     # Get bot configuration if exists
     widget_position = "bottom-right"
     widget_color = "#007bff"
-    
+
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
@@ -961,7 +1082,7 @@ async def get_widget_code(request: WidgetRequest):
                 widget_color = config['widget_color']
     except Exception as e:
         logger.error(f"Error fetching bot config: {e}")
-    
+
     # Position mapping for CSS
     position_styles = {
         "bottom-right": "bottom: 20px; right: 20px;",
@@ -969,9 +1090,9 @@ async def get_widget_code(request: WidgetRequest):
         "top-right": "top: 20px; right: 20px;",
         "top-left": "top: 20px; left: 20px;"
     }
-    
+
     position_css = position_styles.get(widget_position, position_styles["bottom-right"])
-    
+
     widget_code = f"""
     <!-- Navigation Helper Bot Widget -->
     <div id="nav-helper-bot"></div>
@@ -983,7 +1104,7 @@ async def get_widget_code(request: WidgetRequest):
                 position: '{widget_position}',
                 color: '{widget_color}'
             }};
-            
+
             // Create widget container
             var botContainer = document.createElement('div');
             botContainer.id = 'nav-bot-container';
@@ -1003,7 +1124,7 @@ async def get_widget_code(request: WidgetRequest):
                 border: 1px solid rgba(255, 255, 255, 0.3);
                 transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
             `;
-            
+
             // Create toggle button
             var botToggle = document.createElement('button');
             botToggle.innerHTML = '💬';
@@ -1025,18 +1146,18 @@ async def get_widget_code(request: WidgetRequest):
                 align-items: center;
                 justify-content: center;
             `;
-            
+
             // Add hover effects
             botToggle.addEventListener('mouseenter', function() {{
                 this.style.transform = 'translateY(-2px)';
                 this.style.boxShadow = '0 6px 24px rgba(0,0,0,0.2)';
             }});
-            
+
             botToggle.addEventListener('mouseleave', function() {{
                 this.style.transform = 'translateY(0)';
                 this.style.boxShadow = '0 4px 20px rgba(0,0,0,0.15)';
             }});
-            
+
             // Toggle functionality
             var isOpen = false;
             botToggle.onclick = function() {{
@@ -1058,27 +1179,27 @@ async def get_widget_code(request: WidgetRequest):
                     isOpen = false;
                 }}
             }};
-            
+
             // Create iframe
             var iframe = document.createElement('iframe');
             iframe.src = botConfig.apiUrl + '/widget?domain=' + encodeURIComponent(botConfig.domain);
             iframe.style.cssText = 'width: 100%; height: 100%; border: none; border-radius: 16px;';
             iframe.setAttribute('title', 'Navigation Helper Bot');
-            
+
             // Add close on outside click
             document.addEventListener('click', function(e) {{
                 if (isOpen && !botContainer.contains(e.target) && !botToggle.contains(e.target)) {{
                     botToggle.click();
                 }}
             }});
-            
+
             // Add escape key handler
             document.addEventListener('keydown', function(e) {{
                 if (e.key === 'Escape' && isOpen) {{
                     botToggle.click();
                 }}
             }});
-            
+
             // Responsive adjustments
             function adjustForMobile() {{
                 if (window.innerWidth < 480) {{
@@ -1090,28 +1211,28 @@ async def get_widget_code(request: WidgetRequest):
                     botContainer.style.top = 'auto';
                 }}
             }}
-            
+
             window.addEventListener('resize', adjustForMobile);
             adjustForMobile();
-            
+
             botContainer.appendChild(iframe);
             document.body.appendChild(botContainer);
             document.body.appendChild(botToggle);
         }})();
     </script>
     """
-    
+
     return {"widget_code": widget_code, "domain": domain}
 
 @app.get("/api/widget-code/{domain:path}")
 async def get_widget_code_get(domain: str):
     """Generate widget code for integration (GET method with URL decoding)"""
     decoded_domain = unquote(domain)
-    
+
     # Get bot configuration
     widget_position = "bottom-right"
     widget_color = "#007bff"
-    
+
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
@@ -1122,7 +1243,7 @@ async def get_widget_code_get(domain: str):
                 widget_color = config['widget_color']
     except Exception as e:
         logger.error(f"Error fetching bot config: {e}")
-    
+
     # Reuse the POST endpoint logic
     request = WidgetRequest(domain=decoded_domain)
     return await get_widget_code(request)
@@ -1143,7 +1264,7 @@ async def widget_interface(domain: str = None):
                 padding: 0;
                 box-sizing: border-box;
             }
-            
+
             body {
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
                 height: 100vh;
@@ -1152,7 +1273,7 @@ async def widget_interface(domain: str = None):
                 background: linear-gradient(135deg, #000412 0%, #000412 100%);
                 color: #333;
             }
-            
+
             .header {
                 background: rgba(255, 255, 255, 0.01);
                 backdrop-filter: blur(10px);
@@ -1162,7 +1283,7 @@ async def widget_interface(domain: str = None):
                 align-items: center;
                 gap: 12px;
             }
-            
+
             .bot-avatar {
                 width: 36px;
                 height: 36px;
@@ -1174,14 +1295,14 @@ async def widget_interface(domain: str = None):
                 font-size: 18px;
                 color: white;
             }
-            
+
             .header-info h3 {
                 font-size: 16px;
                 font-weight: 600;
                 margin-bottom: 2px;
                 color: white;
             }
-            
+
             .status {
                 font-size: 12px;
                 color: #28a745;
@@ -1189,7 +1310,7 @@ async def widget_interface(domain: str = None):
                 align-items: center;
                 gap: 4px;
             }
-            
+
             .status::before {
                 content: '';
                 width: 8px;
@@ -1198,13 +1319,13 @@ async def widget_interface(domain: str = None):
                 border-radius: 50%;
                 animation: pulse 2s infinite;
             }
-            
+
             @keyframes pulse {
                 0% { opacity: 1; }
                 50% { opacity: 0.5; }
                 100% { opacity: 1; }
             }
-            
+
             .chat-container {
                 flex: 1;
                 overflow-y: auto;
@@ -1214,21 +1335,21 @@ async def widget_interface(domain: str = None):
                 gap: 16px;
                 scroll-behavior: smooth;
             }
-            
+
             .chat-container::-webkit-scrollbar {
                 width: 6px;
             }
-            
+
             .chat-container::-webkit-scrollbar-track {
                 background: rgba(255, 255, 255, 0.1);
                 border-radius: 3px;
             }
-            
+
             .chat-container::-webkit-scrollbar-thumb {
                 background: rgba(255, 255, 255, 0.3);
                 border-radius: 3px;
             }
-            
+
             .message {
                 max-width: 85%;
                 padding: 12px 16px;
@@ -1240,7 +1361,7 @@ async def widget_interface(domain: str = None):
                 word-wrap: break-word;
                 overflow-wrap: break-word;
             }
-            
+
             @keyframes messageSlide {
                 from {
                     opacity: 0;
@@ -1251,7 +1372,7 @@ async def widget_interface(domain: str = None):
                     transform: translateY(0);
                 }
             }
-            
+
             .user-message {
                 background: linear-gradient(135deg, #007bff, #0056b3);
                 color: white;
@@ -1259,7 +1380,7 @@ async def widget_interface(domain: str = None):
                 border-bottom-right-radius: 6px;
                 box-shadow: 0 2px 8px rgba(0, 123, 255, 0.3);
             }
-            
+
             .bot-message {
                 background: rgba(255, 255, 255, 0.95);
                 backdrop-filter: blur(10px);
@@ -1269,7 +1390,7 @@ async def widget_interface(domain: str = None):
                 box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
                 border: 1px solid rgba(255, 255, 255, 0.2);
             }
-            
+
             .typing-indicator {
                 display: none;
                 align-self: flex-start;
@@ -1280,12 +1401,12 @@ async def widget_interface(domain: str = None):
                 border-bottom-left-radius: 6px;
                 max-width: 85px;
             }
-            
+
             .typing-dots {
                 display: flex;
                 gap: 4px;
             }
-            
+
             .typing-dots span {
                 width: 8px;
                 height: 8px;
@@ -1293,15 +1414,15 @@ async def widget_interface(domain: str = None):
                 border-radius: 50%;
                 animation: typing 1.4s infinite ease-in-out;
             }
-            
+
             .typing-dots span:nth-child(2) {
                 animation-delay: 0.2s;
             }
-            
+
             .typing-dots span:nth-child(3) {
                 animation-delay: 0.4s;
             }
-            
+
             @keyframes typing {
                 0%, 60%, 100% {
                     transform: translateY(0);
@@ -1312,7 +1433,7 @@ async def widget_interface(domain: str = None):
                     opacity: 1;
                 }
             }
-            
+
             .input-container {
                 background: rgba(255, 255, 255, 0.01);
                 backdrop-filter: blur(10px);
@@ -1322,14 +1443,14 @@ async def widget_interface(domain: str = None):
                 flex-direction: row;
                 align-items: center;
             }
-            
+
             .input-wrapper {
                display: flex;
                 flex: 1;
                 gap: 12px;
                 align-items: center;
             }
-            
+
             .message-input {
                 width: 100%;
                 min-height: 44px;
@@ -1344,16 +1465,16 @@ async def widget_interface(domain: str = None):
                 transition: all 0.2s ease;
                 background: rgb(229, 222, 222);
             }
-            
+
             .message-input:focus {
                 border-color: #007bff;
                 box-shadow: 0 0 0 3px rgba(0, 123, 255, 0.1);
             }
-            
+
             .message-input::placeholder {
                 color: #999;
             }
-            
+
             .send-button {
                 width: 44px;
                 height: 44px;
@@ -1368,22 +1489,22 @@ async def widget_interface(domain: str = None):
                 transition: all 0.2s ease;
                 box-shadow: 0 2px 8px rgba(0, 123, 255, 0.3);
             }
-            
+
             .send-button:hover:not(:disabled) {
                 transform: translateY(-1px);
                 box-shadow: 0 4px 12px rgba(0, 123, 255, 0.4);
             }
-            
+
             .send-button:disabled {
                 opacity: 0.5;
                 cursor: not-allowed;
             }
-            
+
             .send-button svg {
                 width: 20px;
                 height: 20px;
             }
-            
+
             .welcome-message {
                 text-align: center;
                 padding: 20px;
@@ -1391,7 +1512,7 @@ async def widget_interface(domain: str = None):
                 font-size: 16px;
                 font-weight: 500;
             }
-            
+
             .error-message {
                 background: linear-gradient(135deg, #dc3545, #c82333);
                 color: white;
@@ -1399,7 +1520,7 @@ async def widget_interface(domain: str = None):
                 border-bottom-left-radius: 6px;
                 box-shadow: 0 2px 8px rgba(220, 53, 69, 0.3);
             }
-            
+
             .retry-button {
                 background: rgba(255, 255, 255, 0.2);
                 border: 1px solid rgba(255, 255, 255, 0.3);
@@ -1411,25 +1532,25 @@ async def widget_interface(domain: str = None):
                 margin-top: 8px;
                 transition: all 0.2s ease;
             }
-            
+
             .retry-button:hover {
                 background: rgba(255, 255, 255, 0.3);
             }
-            
+
             @media (max-width: 400px) {
                 .message {
                     max-width: 90%;
                     font-size: 13px;
                 }
-                
+
                 .header {
                     padding: 12px 16px;
                 }
-                
+
                 .input-container {
                     padding: 12px 16px;
                 }
-                
+
                 .chat-container {
                     padding: 16px;
                 }
@@ -1444,13 +1565,13 @@ async def widget_interface(domain: str = None):
                 <div class="status">Online</div>
             </div>
         </div>
-        
+
         <div class="chat-container" id="chatContainer">
             <div class="welcome-message">
                 👋 Hello! I'm your navigation helper. How can I assist you today?
             </div>
         </div>
-        
+
         <div class="typing-indicator" id="typingIndicator">
             <div class="typing-dots">
                 <span></span>
@@ -1458,13 +1579,13 @@ async def widget_interface(domain: str = None):
                 <span></span>
             </div>
         </div>
-        
+
         <div class="input-container ">
             <div class="input-wrapper">
-                <textarea 
-                    id="messageInput" 
-                    class="message-input" 
-                    placeholder="Type your message..." 
+                <textarea
+                    id="messageInput"
+                    class="message-input"
+                    placeholder="Type your message..."
                     rows="1"
                 ></textarea>
                 <button class="send-button" id="sendButton" onclick="sendMessage()">
@@ -1474,26 +1595,26 @@ async def widget_interface(domain: str = None):
                 </button>
             </div>
         </div>
-        
+
         <script>
             const urlParams = new URLSearchParams(window.location.search);
             const domain = urlParams.get('domain');
             let sessionId = Math.random().toString(36).substring(7);
             let retryCount = 0;
             const MAX_RETRIES = 3;
-            
+
             const chatContainer = document.getElementById('chatContainer');
             const messageInput = document.getElementById('messageInput');
             const sendButton = document.getElementById('sendButton');
             const typingIndicator = document.getElementById('typingIndicator');
-            
+
             // Auto-resize textarea
             messageInput.addEventListener('input', function() {
                 this.style.height = 'auto';
                 this.style.height = Math.min(this.scrollHeight, 120) + 'px';
                 sendButton.disabled = !this.value.trim();
             });
-            
+
             // Send message on Enter
             messageInput.addEventListener('keydown', function(e) {
                 if (e.key === 'Enter' && !e.shiftKey) {
@@ -1501,18 +1622,18 @@ async def widget_interface(domain: str = None):
                     sendMessage();
                 }
             });
-            
+
             function addMessage(content, isUser = false, isError = false, showRetry = false) {
                 const messageDiv = document.createElement('div');
                 messageDiv.className = `message ${isUser ? 'user-message' : (isError ? 'error-message' : 'bot-message')}`;
-                
+
                 // Handle HTML content safely
                 if (typeof content === 'string') {
                     messageDiv.textContent = content;
                 } else {
                     messageDiv.innerHTML = content;
                 }
-                
+
                 if (showRetry && isError) {
                     const retryBtn = document.createElement('button');
                     retryBtn.className = 'retry-button';
@@ -1527,56 +1648,56 @@ async def widget_interface(domain: str = None):
                     };
                     messageDiv.appendChild(retryBtn);
                 }
-                
+
                 chatContainer.appendChild(messageDiv);
                 scrollToBottom();
                 return messageDiv;
             }
-            
+
             function showTypingIndicator() {
                 chatContainer.appendChild(typingIndicator);
                 typingIndicator.style.display = 'block';
                 scrollToBottom();
             }
-            
+
             function hideTypingIndicator() {
                 typingIndicator.style.display = 'none';
                 if (typingIndicator.parentNode) {
                     typingIndicator.parentNode.removeChild(typingIndicator);
                 }
             }
-            
+
             function scrollToBottom() {
                 setTimeout(() => {
                     chatContainer.scrollTop = chatContainer.scrollHeight;
                 }, 100);
             }
-            
+
             async function sendMessage(messageText = null) {
                 const message = messageText || messageInput.value.trim();
                 if (!message || sendButton.disabled) return;
-                
+
                 sendButton.disabled = true;
                 messageInput.disabled = true;
-                
+
                 if (!messageText) {
                     addMessage(message, true);
                     messageInput.value = '';
                     messageInput.style.height = 'auto';
                 }
-                
+
                 showTypingIndicator();
-                
+
                 try {
                     const requestBody = {
                         message: message,
                         session_id: sessionId
                     };
-                    
+
                     if (domain) {
                         requestBody.domain = domain;
                     }
-                    
+
                     const response = await fetch('/api/chat', {
                         method: 'POST',
                         headers: {
@@ -1584,24 +1705,24 @@ async def widget_interface(domain: str = None):
                         },
                         body: JSON.stringify(requestBody)
                     });
-                    
+
                     if (!response.ok) {
                         throw new Error(`HTTP error! status: ${response.status}`);
                     }
-                    
+
                     const data = await response.json();
-                    
+
                     hideTypingIndicator();
                     addMessage(data.response || 'I apologize, but I encountered an issue processing your request.');
                     retryCount = 0; // Reset retry count on success
-                    
+
                 } catch (error) {
                     console.error('Error:', error);
                     hideTypingIndicator();
-                    
+
                     let errorMessage = 'Sorry, there was an error processing your message.';
                     let showRetry = false;
-                    
+
                     if (retryCount < MAX_RETRIES) {
                         errorMessage += ' Please try again.';
                         showRetry = true;
@@ -1609,7 +1730,7 @@ async def widget_interface(domain: str = None):
                     } else {
                         errorMessage += ' Please refresh the page and try again.';
                     }
-                    
+
                     addMessage(errorMessage, false, true, showRetry);
                 } finally {
                     messageInput.disabled = false;
@@ -1617,12 +1738,12 @@ async def widget_interface(domain: str = None):
                     sendButton.disabled = !messageInput.value.trim();
                 }
             }
-            
+
             // Initialize
             document.addEventListener('DOMContentLoaded', function() {
                 messageInput.focus();
                 sendButton.disabled = true;
-                
+
                 // Send initial greeting if domain is provided
                 if (domain) {
                     console.log('Widget loaded for domain:', domain);
@@ -1632,7 +1753,7 @@ async def widget_interface(domain: str = None):
     </body>
     </html>
     """
-    
+
     return HTMLResponse(content=html_content)
 
 @app.get("/api/knowledge-base")
@@ -1654,56 +1775,166 @@ async def get_knowledge_base():
 @app.get("/api/sitemap")
 async def get_sitemap():
     """Get generated sitemap (from SQLite)"""
-    logger.info("Received GET request for /api/sitemap") # Added log
+    logger.info("Received GET request for /api/sitemap")
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT url, title, depth FROM sitemap ORDER BY depth, url")
             sitemap = [dict(row) for row in cursor.fetchall()]
-        logger.info(f"Returning {len(sitemap)} sitemap entries.") # Added log
+        logger.info(f"Returning {len(sitemap)} sitemap entries.")
         return {"sitemap": sitemap}
     except Exception as e:
-         logger.error(f"Error fetching sitemap: {e}") # Added error log
+         logger.error(f"Error fetching sitemap: {e}") 
          raise HTTPException(status_code=500, detail=f"Error fetching sitemap: {e}")
 
 @app.delete("/api/knowledge-base")
 async def clear_knowledge_base():
     """Deletes all documents metadata from SQLite and clears Chroma DB."""
-    logger.info("Received DELETE request for /api/knowledge-base") # Added log
+    global rag_chain, chroma_client
+    
+    logger.info("Received DELETE request for /api/knowledge-base")
+    
     if not rag_chain:
-         raise HTTPException(status_code=500, detail="RAG system is not initialized. Cannot clear knowledge base.")
+        raise HTTPException(status_code=500, detail="RAG system is not initialized. Cannot clear knowledge base.")
 
     try:
-        # Clear SQLite metadata
+        # Step 1: Properly close existing RAG system and ChromaDB connections
+        logger.info("Shutting down existing RAG system connections...")
+        
+        # Close ChromaDB client if it exists
+        if chroma_client:
+            try:
+                if hasattr(chroma_client, 'close'):
+                    chroma_client.close()
+                elif hasattr(chroma_client, 'reset'):
+                    chroma_client.reset()
+                logger.info("Closed ChromaDB client connection")
+            except Exception as e:
+                logger.warning(f"Error closing ChromaDB client: {e}")
+            finally:
+                chroma_client = None
+        
+        # Reset RAG chain reference
+        rag_chain = None
+        
+        # Force garbage collection to release file handles
+        gc.collect()
+        
+        # Small delay to ensure file handles are released
+        await asyncio.sleep(0.1)
+
+        # Step 2: Clear SQLite metadata
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM knowledge_base")
             conn.commit()
             logger.info("Cleared knowledge_base table in SQLite.")
 
-        # Clear Chroma DB directory
-        if os.path.exists(CHROMA_DB_PATH):
+        # Step 3: Clear Chroma DB directory with robust error handling
+        chroma_db_path = Path(CHROMA_DB_PATH)
+        
+        if chroma_db_path.exists():
             logger.info(f"Clearing Chroma DB directory: {CHROMA_DB_PATH}")
-            shutil.rmtree(CHROMA_DB_PATH)
-            # Re-initialize RAG chain to connect to the new empty DB
-            initialize_rag_system() # Re-initialize RAG system after clearing Chroma
-            logger.info("Chroma DB cleared and RAG system re-initialized.")
+            
+            success = False
+            max_retries = 3
+            
+            for attempt in range(max_retries):
+                try:
+                    # Method 1: Try direct removal
+                    if attempt == 0:
+                        shutil.rmtree(chroma_db_path)
+                        success = True
+                        logger.info("Successfully removed ChromaDB directory (direct method)")
+                        break
+                    
+                    # Method 2: Remove files individually then directory
+                    elif attempt == 1:
+                        logger.info(f"Attempt {attempt + 1}: Removing files individually...")
+                        
+                        # Remove all files first
+                        for file_path in chroma_db_path.rglob("*"):
+                            if file_path.is_file():
+                                try:
+                                    file_path.unlink()
+                                except (PermissionError, OSError) as e:
+                                    logger.warning(f"Could not delete file {file_path}: {e}")
+                        
+                        # Remove empty directories
+                        for dir_path in sorted(chroma_db_path.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+                            if dir_path.is_dir():
+                                try:
+                                    dir_path.rmdir()
+                                except OSError:
+                                    pass  # Directory not empty, skip
+                        
+                        # Remove main directory
+                        if chroma_db_path.exists():
+                            chroma_db_path.rmdir()
+                        
+                        success = True
+                        logger.info("Successfully removed ChromaDB directory (individual file method)")
+                        break
+                    
+                    # Method 3: Rename and create new directory
+                    else:
+                        logger.info(f"Attempt {attempt + 1}: Using rename method as fallback...")
+                        backup_name = f"{CHROMA_DB_PATH}_backup_{int(time.time())}"
+                        backup_path = Path(backup_name)
+                        
+                        chroma_db_path.rename(backup_path)
+                        logger.info(f"Renamed old ChromaDB directory to {backup_name}")
+                        
+                        # Create new empty directory
+                        chroma_db_path.mkdir(parents=True, exist_ok=True)
+                        success = True
+                        logger.info("Created new empty ChromaDB directory")
+                        break
+                
+                except Exception as e:
+                    logger.warning(f"Attempt {attempt + 1} failed: {e}")
+                    if attempt < max_retries - 1:
+                        # Wait before retry
+                        await asyncio.sleep(1)
+                        gc.collect()  # Try to free up resources
+                    else:
+                        logger.error(f"All {max_retries} attempts to clear ChromaDB failed")
+                        # Don't raise exception, just log and continue
+            
+            if not success:
+                logger.warning("Could not fully clear ChromaDB directory, but continuing with re-initialization")
         else:
-             logger.warning(f"Chroma DB directory not found at {CHROMA_DB_PATH}. Nothing to clear.")
+            logger.warning(f"Chroma DB directory not found at {CHROMA_DB_PATH}. Nothing to clear.")
 
-        return {"message": "Knowledge base cleared successfully."}
+        # Step 4: Re-initialize RAG system
+        try:
+            # Ensure the ChromaDB directory exists
+            chroma_db_path.mkdir(parents=True, exist_ok=True)
+            
+            # Re-initialize RAG system
+            initialize_rag_system()
+            logger.info("RAG system re-initialized successfully.")
+            
+            return {"message": "Knowledge base cleared and RAG system re-initialized successfully."}
+            
+        except Exception as init_error:
+            logger.error(f"Error re-initializing RAG system: {init_error}")
+            return {
+                "message": "Knowledge base cleared but RAG system re-initialization failed. Please restart the application.",
+                "warning": str(init_error)
+            }
 
     except sqlite3.Error as db_error:
         logger.error(f"Database error clearing knowledge base: {db_error}")
         raise HTTPException(status_code=500, detail=f"Database error clearing knowledge base: {db_error}")
     except Exception as e:
-        logger.error(f"Error clearing knowledge base: {e}")
+        logger.error(f"Error clearing knowledge base: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
 @app.get("/api/status")
 async def get_status():
     """Provides status of the RAG system and database."""
-    logger.info("Received GET request for /api/status") # Added log
+    logger.info("Received GET request for /api/status")
     rag_status = "Initialized" if rag_chain else "Not Initialized (Check logs for errors like missing API key)"
 
     db_status = "Connected"
@@ -1764,4 +1995,4 @@ async def get_status():
 if __name__ == "__main__":
     PORT = 8000
     os.makedirs(CHROMA_DB_PATH, exist_ok=True)
-    uvicorn.run(host="0.0.0.0", port=PORT, debug=True, use_reloader=False)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
