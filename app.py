@@ -25,7 +25,7 @@ st.set_page_config(
 )
 
 # Backend API URL
-API_BASE_URL = "http://localhost:8000"
+API_BASE_URL = "https://bot-1-rb8s.onrender.com"
 
 # Custom CSS for better styling
 st.markdown("""
