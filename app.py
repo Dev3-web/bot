@@ -80,13 +80,13 @@ def make_api_request(endpoint, method="GET", data=None, files=None):
         url = f"{API_BASE_URL}{endpoint}"
         
         if method == "GET":
-            response = requests.get(url, timeout=300)
+            response = requests.get(url, timeout=400)
         elif method == "POST":
             if files:
-                response = requests.post(url, files=files, data=data, timeout=300)
+                response = requests.post(url, files=files, data=data, timeout=400)
             else:
                 headers = {'Content-Type': 'application/json'}
-                response = requests.post(url, json=data, headers=headers, timeout=300)
+                response = requests.post(url, json=data, headers=headers, timeout=400)
         
         # Check if request was successful
         if response.status_code == 200:
