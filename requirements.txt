@@ -18,6 +18,3 @@ pandas
 openai
 firecrawl-py
 playwright
-gc
-deque
-Path
