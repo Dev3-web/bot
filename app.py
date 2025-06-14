@@ -80,13 +80,13 @@ def make_api_request(endpoint, method="GET", data=None, files=None):
         url = f"{API_BASE_URL}{endpoint}"
         
         if method == "GET":
-            response = requests.get(url, timeout=400)
+            response = requests.get(url)
         elif method == "POST":
             if files:
-                response = requests.post(url, files=files, data=data, timeout=400)
+                response = requests.post(url, files=files, data=data)
             else:
                 headers = {'Content-Type': 'application/json'}
-                response = requests.post(url, json=data, headers=headers, timeout=400)
+                response = requests.post(url, json=data, headers=headers)
         
         # Check if request was successful
         if response.status_code == 200:
@@ -667,7 +667,7 @@ def dashboard_analytics():
 def test_backend_connection():
     """Test if backend is running"""
     try:
-        response = requests.get(f"{API_BASE_URL}/", timeout=30)
+        response = requests.get(f"{API_BASE_URL}/")
         return response.status_code == 200
     except:
         return False
