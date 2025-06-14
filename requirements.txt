@@ -16,3 +16,4 @@ python-multipart
 streamlit
 pandas
 openai
+firecrawl-py

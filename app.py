@@ -80,13 +80,13 @@ def make_api_request(endpoint, method="GET", data=None, files=None):
         url = f"{API_BASE_URL}{endpoint}"
         
         if method == "GET":
-            response = requests.get(url, timeout=100)
+            response = requests.get(url, timeout=300)
         elif method == "POST":
             if files:
-                response = requests.post(url, files=files, data=data, timeout=100)
+                response = requests.post(url, files=files, data=data, timeout=300)
             else:
                 headers = {'Content-Type': 'application/json'}
-                response = requests.post(url, json=data, headers=headers, timeout=100)
+                response = requests.post(url, json=data, headers=headers, timeout=300)
         
         # Check if request was successful
         if response.status_code == 200:
@@ -183,32 +183,39 @@ def step1_upload_sources():
 
 def step2_generate_sitemap():
     """Step 2: Generate sitemap automatically"""
-    st.markdown('<div class="step-header"><h2>🗺️ Step 2: Generate Website Sitemap</h2></div>', unsafe_allow_html=True)
+    st.markdown('<div class="step-header"><h2>🗺️ Step 2: Generate Website Sitemap & Goals</h2></div>', unsafe_allow_html=True)
     
     st.markdown("""
     <div class="info-box">
-    <strong>What this does:</strong> Automatically crawl your website to understand its structure 
-    and help the bot guide users to the right pages.
+    <strong>What this does:</strong> Our AI-powered crawler (Firecrawl) will analyze your website to understand its structure.
+    It will then use this data to automatically suggest user goals for your bot.
     </div>
     """, unsafe_allow_html=True)
     
     domain = st.text_input(
         "Enter your website domain",
         placeholder="example.com or https://example.com",
-        help="The bot will crawl your website to understand its structure"
+        help="The bot will crawl your website to understand its structure and suggest goals."
     )
     
-    if domain and st.button("Generate Sitemap", key="generate_sitemap"):
-        with st.spinner("Crawling website and generating sitemap..."):
+    if domain and st.button("Generate Sitemap and Suggest Goals", key="generate_sitemap"):
+        with st.spinner("Crawling website and using AI to suggest goals... This may take a minute."):
             result = make_api_request("/api/generate-sitemap", "POST", {"domain": domain})
             
             if result:
                 st.markdown(f"""
                 <div class="success-box">
-                Sitemap generated successfully!
+                ✅ Sitemap generated and goals suggested successfully!
+                <br><strong>Pages Found:</strong> {result.get('pages_found', 'N/A')}
                 </div>
                 """, unsafe_allow_html=True)
+                
+                # --- THIS IS THE CRITICAL CHANGE ---
+                # Store the domain and the suggested goals in the session state
                 st.session_state.bot_config['domain'] = domain
+                st.session_state['suggested_goals'] = result.get('suggested_goals', [])
+                # --- END OF CRITICAL CHANGE ---
+                
                 time.sleep(1)
                 st.session_state.current_step = 3
                 st.rerun()
@@ -670,18 +677,18 @@ def main():
     st.markdown('<h1 class="main-header">🤖 Navigation Helper Bot Dashboard</h1>', unsafe_allow_html=True)
     
     # Test backend connection
-    if not test_backend_connection():
-        st.error("""
-        ❌ **Backend Not Running**
+    # if not test_backend_connection():
+    #     st.error("""
+    #     ❌ **Backend Not Running**
         
-        The backend API is not accessible. Please:
-        1. Make sure you're running `python main.py` in another terminal
-        2. Check if the backend is running on http://localhost:8000
-        3. Verify no firewall is blocking the connection
-        """)
-        st.stop()
-    else:
-        st.success("✅ Backend connection successful!")
+    #     The backend API is not accessible. Please:
+    #     1. Make sure you're running `python main.py` in another terminal
+    #     2. Check if the backend is running on http://localhost:8000
+    #     3. Verify no firewall is blocking the connection
+    #     """)
+    #     st.stop()
+    # else:
+    #     st.success("✅ Backend connection successful!")
     
     # Sidebar navigation
     st.sidebar.title("🎛️ Navigation")

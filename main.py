@@ -18,14 +18,15 @@ import PyPDF2
 import docx
 import io
 import logging
-import shutil 
+import shutil
 import time
 import random
 import logging as logger
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import re
-
+import asyncio
+from playwright.async_api import async_playwright, Browser, Page
 
 # --- Langchain / RAG Imports ---
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
@@ -36,6 +37,9 @@ from langchain.chains import RetrievalQA
 from langchain_openai import ChatOpenAI # Or use another LLM via langchain_community
 from langchain_core.documents import Document # For creating Langchain Document objects
 
+# --- NEW: Firecrawl Import ---
+from firecrawl import FirecrawlApp
+
 # --- Environment Variables ---
 from dotenv import load_dotenv
 load_dotenv() # Load environment variables from .env file
@@ -44,9 +48,10 @@ load_dotenv() # Load environment variables from .env file
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     logger.error("OPENAI_API_KEY environment variable not set!")
-    # In a real application, you might want to raise an exception or exit
-    # For this example, we'll proceed but RAG features will fail without it.
-    # raise EnvironmentError("OPENAI_API_KEY environment variable not set.")
+    
+FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
+if not FIRECRAWL_API_KEY:
+    logger.error("FIRECRAWL_API_KEY environment variable not set!")    
 
 
 # Configure logging
@@ -58,7 +63,7 @@ app = FastAPI(title="Navigation Helper Bot API (RAG Enabled)", version="2.0.0")
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Allow all origins for simplicity, restrict in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -67,41 +72,32 @@ app.add_middleware(
 # --- Database Setup (for metadata and logs) ---
 DATABASE_FILE = "nav_bot.db"
 
-GOAL_KEYWORDS = {
-    "Contact Us": ['contact', 'get in touch', 'address', 'phone', 'location', 'contact-us'],
-    "Schedule a Demo": ['demo', 'schedule a call', 'book a meeting', 'request-a-demo'],
-    "View Pricing": ['pricing', 'plans', 'subscribe', 'cost'],
-    "Explore Products/Store": ['product', 'store', 'shop', 'buy', 'cart', 'checkout'],
-    "Learn About Services": ['service', 'what we do', 'our work', 'solutions'],
-    "Read the Blog/News": ['blog', 'news', 'article', 'update', 'stories'],
-    "Access Help/Support": ['documentation', 'help', 'support', 'faq', 'knowledge base', 'knowledge-base'],
-    "User Login/Account": ['login', 'signin', 'sign-in', 'my-account', 'my account'],
-    "User Registration": ['register', 'signup', 'sign-up', 'create-account', 'create account'],
-    "Explore Career Opportunities": ['career', 'job', 'hiring', 'work with us'],
-    "Learn About the Company": ['about', 'about-us', 'our story', 'our team', 'company'],
-}
-
 def suggest_goals_from_content(sitemap_data: List[Dict]) -> List[str]:
     """
-    Analyzes crawled content to suggest potential user goals.
+    Analyzes crawled content to suggest potential user goals as a fallback.
     """
+    GOAL_KEYWORDS = {
+        "Contact Us": ['contact', 'get in touch', 'address', 'phone', 'location', 'contact-us'],
+        "Schedule a Demo": ['demo', 'schedule a call', 'book a meeting', 'request-a-demo'],
+        "View Pricing": ['pricing', 'plans', 'subscribe', 'cost'],
+        "Explore Products/Store": ['product', 'store', 'shop', 'buy', 'cart', 'checkout'],
+        "Learn About Services": ['service', 'what we do', 'our work', 'solutions'],
+        "Read the Blog/News": ['blog', 'news', 'article', 'update', 'stories'],
+        "Access Help/Support": ['documentation', 'help', 'support', 'faq', 'knowledge base', 'knowledge-base'],
+        "User Login/Account": ['login', 'signin', 'sign-in', 'my-account', 'my account'],
+        "User Registration": ['register', 'signup', 'sign-up', 'create-account', 'create account'],
+        "Explore Career Opportunities": ['career', 'job', 'hiring', 'work with us'],
+        "Learn About the Company": ['about', 'about-us', 'our story', 'our team', 'company'],
+    }
     found_goals = set()
     if not sitemap_data:
         return []
-
-    # Combine all text, titles, and URLs for efficient searching
-    full_text = " ".join(
-        f"{p.get('url', '').lower()} {p.get('title', '').lower()} {p.get('content', ' ')}"
-        for p in sitemap_data
-    )
-
+    full_text = " ".join(f"{p.get('url', '').lower()} {p.get('title', '').lower()} {p.get('content', ' ')}" for p in sitemap_data)
     for goal, keywords in GOAL_KEYWORDS.items():
-        # Use regex for word boundaries to avoid partial matches (e.g., 'about' in 'about-us')
         if any(re.search(r'\b' + re.escape(keyword) + r'\b', full_text) for keyword in keywords):
             found_goals.add(goal)
-
-    # Limit the number of suggestions to a reasonable amount
     return sorted(list(found_goals))[:8]
+
 
 def init_database():
     """Initialize SQLite database with required tables"""
@@ -133,7 +129,6 @@ def init_database():
     ''')
 
     # Bot configurations table
-    # Using SQL comments (--) instead of Python comments (#) within the SQL string
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS bot_config (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -316,365 +311,319 @@ def generate_file_hash(content: bytes) -> str:
     """Generate SHA-256 hash of file content"""
     return hashlib.sha256(content).hexdigest()
 
-def crawl_website(base_url: str, max_depth: int = 2, max_pages: int = 50) -> List[Dict]:
-    """Crawl website and extract sitemap information with improved error handling"""
-    
-    # Basic validation and normalization of URL
-    try:
-        # Clean and validate base URL
-        base_url = base_url.strip()
-        if not base_url:
-            logger.error("Empty base URL provided")
-            return []
-            
-        parsed_url = urlparse(base_url)
-        if not parsed_url.scheme:
-            base_url = "https://" + base_url
-            parsed_url = urlparse(base_url)
-        
-        if not parsed_url.netloc:
-            logger.error(f"Invalid base URL: {base_url}")
-            return []
-            
-        base_netloc = parsed_url.netloc.lower()
-        
-    except Exception as e:
-        logger.error(f"Error parsing base URL {base_url}: {e}")
-        return []
+async def crawl_with_playwright(url: str, max_pages: int = 25) -> List[Dict]:
+    """
+    Crawls a website using Playwright and formats the output.
+    """
+    # Ensure URL has proper protocol
+    if not url.startswith(('http://', 'https://')):
+        url = f'https://{url}'
 
-    visited: Set[str] = set()
-    sitemap_data: List[Dict] = []
-    session = requests.Session()
+    logger.info(f"Starting Playwright crawl for URL: {url} with a limit of {max_pages} pages.")
     
-    # Rotate between different user agents to avoid blocking
-    user_agents = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0'
-    ]
+    crawled_pages = []
+    visited_urls = set()
+    urls_to_visit = [url]
+    base_domain = urlparse(url).netloc
     
-    # Configure session with improved retry strategy
-    retry_strategy = Retry(
-        total=3,
-        backoff_factor=1,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "OPTIONS"]
-    )
-    
-    adapter = HTTPAdapter(max_retries=retry_strategy)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    
-    # Set session headers
-    session.headers.update({
-        'User-Agent': random.choice(user_agents),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Cache-Control': 'max-age=0'
-    })
-
-    def normalize_url(url: str) -> str:
-        """Normalize URL for consistent comparison"""
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        
         try:
-            if not url:
-                return ""
-            
-            url = url.strip()
-            parsed = urlparse(url)
-            
-            # Remove fragment and normalize query parameters
-            normalized = parsed._replace(fragment="")
-            url_str = urlunparse(normalized)
-            
-            # Remove trailing slash except for root URLs  
-            if url_str.endswith('/') and url_str.count('/') > 3:
-                url_str = url_str[:-1]
-                
-            return url_str
-        except Exception as e:
-            logger.warning(f"Error normalizing URL {url}: {e}")
-            return ""
-
-    def is_valid_content_type(response) -> bool:
-        """Check if response is HTML content"""
-        content_type = response.headers.get('content-type', '').lower()
-        return any(ct in content_type for ct in ['text/html', 'application/xhtml'])
-
-    def extract_text_content(soup) -> str:
-        """Extract and clean text content from soup"""
-        try:
-            # Remove unwanted elements
-            for element in soup(["script", "style", "nav", "header", "footer", "aside", "noscript"]):
-                element.decompose()
-            
-            # Extract text from relevant elements
-            content_elements = soup.find_all([
-                'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 
-                'li', 'td', 'div', 'article', 'section', 'main'
-            ])
-            
-            texts = []
-            for element in content_elements:
-                text = element.get_text(strip=True)
-                if text and len(text) > 15:  # Filter out very short text
-                    texts.append(text)
-            
-            content = " ".join(texts)
-            # Clean up whitespace and normalize
-            content = re.sub(r'\s+', ' ', content).strip()
-            
-            return content[:3000]  # Increased content length limit
-            
-        except Exception as e:
-            logger.warning(f"Error extracting content: {e}")
-            return ""
-
-    def should_skip_url(url: str) -> bool:
-        """Check if URL should be skipped based on common patterns"""
-        url_lower = url.lower()
-        skip_patterns = [
-            '.pdf', '.jpg', '.jpeg', '.png', '.gif', '.svg', '.ico',
-            '.zip', '.rar', '.tar', '.gz', '.doc', '.docx', '.xls', '.xlsx',
-            '.ppt', '.pptx', '.mp3', '.mp4', '.avi', '.mov', '.wmv',
-            '.css', '.js', '.xml', '.json', '.rss', '.atom',
-            '/wp-admin/', '/admin/', '/login', '/register', '/dashboard/',
-            '/api/', '/ajax/', '/search?', '/tag/', '/category/',
-            '#', 'javascript:', 'mailto:', 'tel:', 'ftp:'
-        ]
-        
-        return any(pattern in url_lower for pattern in skip_patterns)
-
-    def crawl_page(url: str, depth: int = 0, parent_url: str = None):
-        """Crawl individual page with comprehensive error handling"""
-        
-        # Check limits
-        if len(sitemap_data) >= max_pages:
-            logger.info(f"Reached maximum pages limit ({max_pages})")
-            return
-            
-        if depth > max_depth:
-            return
-
-        normalized_url = normalize_url(url)
-        if not normalized_url or normalized_url in visited:
-            return
-
-        # Skip URLs that are likely not content pages
-        if should_skip_url(normalized_url):
-            return
-
-        visited.add(normalized_url)
-        logger.info(f"Crawling: {normalized_url} (Depth: {depth})")
-
-        try:
-            # Add random delay to be respectful and avoid rate limiting
-            if len(visited) > 1:
-                time.sleep(random.uniform(0.5, 2.0))
-
-            # Rotate user agent occasionally
-            if len(visited) % 10 == 0:
-                session.headers['User-Agent'] = random.choice(user_agents)
-
-            # First, try a HEAD request to check if the resource exists
-            try:
-                head_response = session.head(
-                    normalized_url,
-                    timeout=(5, 10),
-                    allow_redirects=True
-                )
-                
-                # Check if it's likely HTML content
-                content_type = head_response.headers.get('content-type', '').lower()
-                if not any(ct in content_type for ct in ['text/html', 'application/xhtml', 'text/plain']):
-                    logger.info(f"Skipping non-HTML content: {normalized_url} (Content-Type: {content_type})")
-                    return
+            for depth in range(3):  # Max depth of 3
+                if not urls_to_visit or len(crawled_pages) >= max_pages:
+                    break
                     
-            except Exception as head_error:
-                logger.warning(f"HEAD request failed for {normalized_url}: {head_error}")
-                # Continue with GET request anyway
-
-            # Make the actual GET request
-            response = session.get(
-                normalized_url, 
-                timeout=(10, 30),
-                allow_redirects=True,
-                stream=False
-            )
-            
-            # Check response status
-            if response.status_code == 403:
-                logger.warning(f"Access forbidden (403) for: {normalized_url}")
-                return
-            elif response.status_code == 404:
-                logger.warning(f"Page not found (404) for: {normalized_url}")
-                return
-            elif response.status_code >= 400:
-                logger.warning(f"HTTP error {response.status_code} for: {normalized_url}")
-                return
-            
-            response.raise_for_status()
-            
-            # Check content type again
-            if not is_valid_content_type(response):
-                logger.warning(f"Skipping non-HTML content: {normalized_url}")
-                return
-            
-            # Check content size (avoid very large pages)
-            content_length = len(response.content)
-            if content_length > 10 * 1024 * 1024:  # 10MB limit
-                logger.warning(f"Skipping large page ({content_length} bytes): {normalized_url}")
-                return
-
-            # Handle redirects - check if still within same domain
-            final_url = normalize_url(response.url)
-            if final_url != normalized_url:
-                parsed_final = urlparse(response.url)
-                if parsed_final.netloc.lower() != base_netloc:
-                    logger.info(f"Redirect outside domain: {normalized_url} -> {response.url}")
-                    return
-                visited.add(final_url)
-                normalized_url = final_url
-
-            # Parse HTML with better error handling
-            try:
-                soup = BeautifulSoup(response.content, 'html.parser', from_encoding=response.encoding)
-            except Exception as parse_error:
-                logger.error(f"Error parsing HTML for {normalized_url}: {parse_error}")
-                # Try with lxml parser as fallback
-                try:
-                    soup = BeautifulSoup(response.content, 'lxml', from_encoding=response.encoding)
-                except:
-                    # Final fallback to html.parser without encoding
-                    soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Extract title with better handling
-            title_text = ""
-            title_element = soup.find('title')
-            if title_element:
-                title_text = title_element.get_text().strip()
-                title_text = re.sub(r'\s+', ' ', title_text)[:300]
-            
-            # Try meta description if no title
-            if not title_text:
-                meta_desc = soup.find('meta', attrs={'name': 'description'})
-                if meta_desc and meta_desc.get('content'):
-                    title_text = meta_desc.get('content').strip()[:300]
-
-            # Extract content
-            content = extract_text_content(soup)
-            
-            # Skip pages with very little content
-            if len(content.strip()) < 50:
-                logger.info(f"Skipping page with minimal content: {normalized_url}")
-                return
-
-            # Store page data
-            page_data = {
-                'url': normalized_url,
-                'title': title_text,
-                'content': content,
-                'parent_url': parent_url,
-                'depth': depth,
-                'status_code': response.status_code,
-                'content_length': len(content)
-            }
-            
-            sitemap_data.append(page_data)
-            logger.info(f"Successfully crawled: {normalized_url} (Title: {title_text[:50]}...)")
-
-            # Find and crawl child links
-            if depth < max_depth and len(sitemap_data) < max_pages:
-                links_found = 0
-                all_links = soup.find_all('a', href=True)
+                current_level_urls = urls_to_visit.copy()
+                urls_to_visit = []
                 
-                # Shuffle links to get diverse content
-                random.shuffle(all_links)
-                
-                for link in all_links:
-                    if len(sitemap_data) >= max_pages:
+                for current_url in current_level_urls:
+                    if len(crawled_pages) >= max_pages:
                         break
                         
-                    try:
-                        href = link.get('href', '').strip()
-                        if not href:
-                            continue
-
-                        # Skip obviously non-content links
-                        if should_skip_url(href):
-                            continue
-
-                        # Resolve relative URLs
-                        full_url = urljoin(normalized_url, href)
-                        
-                        # Clean URL (remove fragments and some query params)
-                        clean_url = full_url.split('#')[0]
-                        
-                        parsed_link = urlparse(clean_url)
-                        
-                        # Only crawl internal links
-                        if parsed_link.netloc.lower() == base_netloc:
-                            crawl_page(clean_url, depth + 1, normalized_url)
-                            links_found += 1
-                            
-                            # Limit links per page but be more generous
-                            if links_found >= 30:
-                                break
-                                
-                    except Exception as link_error:
-                        logger.warning(f"Error processing link {href}: {link_error}")
+                    if current_url in visited_urls:
                         continue
-
-        except requests.exceptions.Timeout:
-            logger.error(f"Timeout crawling {normalized_url}")
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"Connection error crawling {normalized_url}: {e}")
-        except requests.exceptions.HTTPError as e:
-            logger.error(f"HTTP error crawling {normalized_url}: {e}")
-        except requests.exceptions.TooManyRedirects:
-            logger.error(f"Too many redirects for {normalized_url}")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request error crawling {normalized_url}: {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error crawling {normalized_url}: {e}")
-
-    # Start crawling with better initial URL handling
-    try:
-        # Try to crawl robots.txt first to respect crawling rules
-        try:
-            robots_url = f"{parsed_url.scheme}://{parsed_url.netloc}/robots.txt"
-            robots_response = session.get(robots_url, timeout=20)
-            if robots_response.status_code == 200:
-                logger.info(f"Found robots.txt for {base_netloc}")
-                # Basic robots.txt parsing could be added here
-        except:
-            pass  # Ignore robots.txt errors
-            
-        # Start crawling from the base URL
-        crawl_page(base_url)
-        
-        # If we didn't get enough pages, try common paths
-        if len(sitemap_data) < 5:
-            common_paths = ['/about', '/contact', '/services', '/products', '/blog', '/news']
-            for path in common_paths:
-                if len(sitemap_data) >= max_pages:
-                    break
-                try_url = f"{parsed_url.scheme}://{parsed_url.netloc}{path}"
-                crawl_page(try_url, 1, base_url)
-                
-    finally:
-        session.close()
+                        
+                    try:
+                        page_data = await scrape_page(browser, current_url, depth)
+                        if page_data:
+                            crawled_pages.append(page_data)
+                            visited_urls.add(current_url)
+                            
+                            # Extract links for next level
+                            if depth < 2:  # Only extract links if we haven't reached max depth
+                                links = await extract_links(browser, current_url, base_domain)
+                                for link in links:
+                                    if link not in visited_urls and link not in urls_to_visit:
+                                        urls_to_visit.append(link)
+                                        
+                    except Exception as e:
+                        logger.warning(f"Error scraping {current_url}: {e}")
+                        continue
+                        
+        finally:
+            await browser.close()
     
-    logger.info(f"Crawling completed. Found {len(sitemap_data)} pages.")
-    return sitemap_data
+    logger.info(f"Crawling completed. Found {len(crawled_pages)} pages.")
+    print("total crawled pages:", crawled_pages)
+    return crawled_pages
 
+
+async def scrape_page(browser: Browser, url: str, depth: int = 0) -> Dict:
+    """
+    Scrape a single page using Playwright.
+    """
+    page = await browser.new_page()
+    
+    try:
+        # Set user agent to avoid bot detection
+        await page.set_extra_http_headers({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
+        
+        # Navigate to page with timeout
+        await page.goto(url, wait_until='domcontentloaded', timeout=200)
+        
+        # Wait for content to load
+        await page.wait_for_timeout(200)
+        
+        # Extract page title
+        title = await page.title()
+        
+        # Extract main content
+        content = await extract_main_content(page)
+        
+        # Get page URL (in case of redirects)
+        final_url = page.url
+        
+        return {
+            'url': final_url,
+            'title': title or 'Untitled',
+            'content': content,
+            'depth': depth,
+            'parent_url': None  # You can track parent URLs if needed
+        }
+        
+    except Exception as e:
+        logger.error(f"Error scraping page {url}: {e}")
+        return None
+        
+    finally:
+        await page.close()
+
+
+async def extract_main_content(page: Page) -> str:
+    """
+    Extract main content from a page, filtering out navigation, ads, etc.
+    """
+    try:
+        # Try to get main content using common selectors
+        main_selectors = [
+            'main',
+            'article',
+            '.main-content',
+            '.content',
+            '#main',
+            '#content',
+            '.post-content',
+            '.entry-content'
+        ]
+        
+        content_text = ""
+        
+        # Try each selector to find main content
+        for selector in main_selectors:
+            try:
+                element = await page.query_selector(selector)
+                if element:
+                    content_text = await element.inner_text()
+                    if content_text and len(content_text.strip()) > 100:
+                        break
+            except:
+                continue
+        
+        # If no main content found, get body content and filter
+        if not content_text or len(content_text.strip()) < 100:
+            # Get all text content
+            content_text = await page.evaluate('''
+                () => {
+                    // Remove script and style elements
+                    const scripts = document.querySelectorAll('script, style, nav, header, footer, aside, .nav, .navigation, .menu, .sidebar');
+                    scripts.forEach(el => el.remove());
+                    
+                    // Get body text
+                    return document.body.innerText || document.body.textContent || '';
+                }
+            ''')
+        
+        # Clean up the content
+        content_text = clean_content(content_text)
+        
+        # Limit content length to avoid huge texts
+        if len(content_text) > 5000:
+            content_text = content_text[:5000] + "..."
+            
+        print("Content extracted:", content_text) 
+        return content_text
+        
+    except Exception as e:
+        logger.error(f"Error extracting content: {e}")
+        return ""
+
+
+async def extract_links(browser: Browser, url: str, base_domain: str) -> List[str]:
+    """
+    Extract all internal links from a page.
+    """
+    page = await browser.new_page()
+    links = []
+    
+    try:
+        await page.goto(url, wait_until='domcontentloaded', timeout=200)
+        
+        # Extract all links
+        link_elements = await page.query_selector_all('a[href]')
+        
+        for link_element in link_elements:
+            href = await link_element.get_attribute('href')
+            if href:
+                # Convert relative URLs to absolute
+                absolute_url = urljoin(url, href)
+                
+                # Check if link is internal and valid
+                if is_valid_internal_link(absolute_url, base_domain):
+                    links.append(absolute_url)
+                    
+    except Exception as e:
+        logger.error(f"Error extracting links from {url}: {e}")
+        
+    finally:
+        await page.close()
+    
+    print("Extracted links:", links)
+    return list(set(links))  # Remove duplicates
+
+
+def is_valid_internal_link(url: str, base_domain: str) -> bool:
+    """
+    Check if a URL is a valid internal link.
+    """
+    try:
+        parsed = urlparse(url)
+        
+        # Must be same domain
+        if parsed.netloc != base_domain:
+            return False
+            
+        # Skip certain file types and paths
+        excluded_extensions = ['.pdf', '.jpg', '.jpeg', '.png', '.gif', '.css', '.js', '.xml', '.zip']
+        excluded_paths = ['/feed/', '/rss/', '/admin/', '/wp-admin/', '/wp-content/', '/wp-includes/']
+        
+        path = parsed.path.lower()
+        
+        # Check extensions
+        for ext in excluded_extensions:
+            if path.endswith(ext):
+                return False
+                
+        # Check paths
+        for excluded_path in excluded_paths:
+            if excluded_path in path:
+                return False
+                
+        return True
+        
+    except Exception:
+        return False
+
+
+def clean_content(text: str) -> str:
+    """
+    Clean and normalize extracted text content.
+    """
+    if not text:
+        return ""
+        
+    # Remove extra whitespace
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Remove common unwanted patterns
+    text = re.sub(r'Skip to.*?content', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'Cookie.*?policy', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'Privacy.*?policy', '', text, flags=re.IGNORECASE)
+    
+    # Remove multiple consecutive periods or dashes
+    text = re.sub(r'[.]{3,}', '...', text)
+    text = re.sub(r'[-]{3,}', '---', text)
+    
+    return text.strip()
+
+
+def generate_goals_with_ai(crawled_data: List[Dict]) -> List[str]:
+    """
+    Uses OpenAI's GPT model to analyze crawled website content and suggest user goals.
+    """
+    if not OPENAI_API_KEY:
+        logger.warning("OpenAI API key not set. Cannot generate AI goals.")
+        return []
+
+    if not crawled_data:
+        logger.warning("No crawled data provided to generate goals.")
+        return []
+    
+    logger.info("Generating user goals with AI...")
+
+    # Combine content from the first few pages to create a context for the LLM
+    # We limit this to avoid exceeding token limits
+    context = ""
+    for i, page in enumerate(crawled_data[:5]): # Use up to the first 5 pages
+        context += f"--- Page {i+1}: {page.get('title', '')} ---\n"
+        context += page.get('content', '')[:2000] # Limit content per page
+        context += "\n\n"
+
+    if not context.strip():
+        logger.warning("Could not extract any content to send to AI.")
+        return []
+
+    # Define the prompt for the AI
+    logger.info("Creating AI prompt for goal generation...", context)
+    prompt = f"""
+    You are an expert in user experience and marketing strategy. Your task is to analyze the content of a website and suggest the most common user goals or "jobs to be done".
+
+    Based on the following content crawled from a website, identify the top 5-7 most likely actions a user would want to take on this site. These goals will be used for a navigation chatbot.
+
+    Guidelines:
+    - Each goal must be a short, clear, action-oriented phrase (e.g., "Schedule a Demo", "View Pricing", "Contact Support").
+    - Do not use any introductory text like "Here are the suggested goals:".
+    - Just provide a clean, new-line separated list.
+    - Do not number the list or use bullet points.
+
+    Website Content:
+    {context}
+    """
+
+    try:
+        # Use the ChatOpenAI model for the completion
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2, openai_api_key=OPENAI_API_KEY)
+        response = llm.invoke(prompt)
+        
+        # The response content will be in response.content for Chat Models
+        raw_goals = response.content.strip()
+
+        # Process the response into a clean list
+        # Split by newline and filter out any empty lines or extra characters
+        goals = [
+            re.sub(r'^\s*[\d\.\-\*]+\s*', '', line).strip()
+            for line in raw_goals.split('\n')
+            if line.strip()
+        ]
+        
+        logger.info(f"AI suggested goals: {goals}")
+        return goals[:8] # Return up to 8 goals
+
+    except Exception as e:
+        logger.error(f"Error calling OpenAI to generate goals: {e}")
+        return []
 
 class ChatMessage(BaseModel):
     message: str
@@ -816,60 +765,75 @@ async def upload_documents(files: List[UploadFile] = File(...)):
 
 @app.post("/api/generate-sitemap")
 async def generate_sitemap(request: SitemapRequest):
-    """Generate sitemap by crawling the website and suggest user goals"""
+    """
+    Generate sitemap using Playwright and suggest user goals using AI.
+    """
     domain = request.domain
-    logger.info(f"Starting sitemap crawl for domain: {domain}")
-    
+    logger.info(f"Starting sitemap and goal generation for domain: {domain}")
+
     try:
-        sitemap_data = crawl_website(domain, max_depth=3, max_pages=100)
+        # Step 1: Crawl the website using Playwright
+        sitemap_data = await crawl_with_playwright(domain, max_pages=110)
         logger.info(f"Finished crawling. Found {len(sitemap_data)} pages.")
 
         if not sitemap_data:
+            # More specific error handling
             logger.warning(f"No pages found for domain: {domain}")
-            return {
-                "message": "No pages found. The website might be blocking crawlers or have issues.", 
-                "pages_found": 0, 
-                "pages_saved_to_db": 0,
-                "suggested_goals": []
-            }
+            
+            # Try to provide more helpful error information
+            if not domain.startswith(('http://', 'https://')):
+                test_url = f'https://{domain}'
+            else:
+                test_url = domain
+                
+            raise HTTPException(
+                status_code=404,
+                detail=f"No pages found for {domain}. Please check if the website is accessible at {test_url} and allows crawling."
+            )
 
-        # --- DYNAMIC GOAL SUGGESTION ---
-        suggested_goals = suggest_goals_from_content(sitemap_data)
-        logger.info(f"Suggested Goals based on content: {suggested_goals}")
+        # Step 2: Generate goal suggestions using AI
+        logger.info("data ----------------------------", sitemap_data)
+        suggested_goals = generate_goals_with_ai(sitemap_data)
         
+        # Fallback to keyword-based suggestions if AI fails or returns nothing
+        if not suggested_goals:
+            logger.warning("AI goal generation failed or returned no goals. Falling back to keyword-based suggestions.")
+            suggested_goals = suggest_goals_from_content(sitemap_data)
+
+        logger.info(f"Final suggested goals: {suggested_goals}")
+
+        # Step 3: Save the sitemap to the database
         with get_db_connection() as conn:
             cursor = conn.cursor()
-
-            # Delete existing sitemap data for this domain
-            cursor.execute("DELETE FROM sitemap")
-            logger.info("Cleared existing sitemap data from DB.")
-
-            # Insert new sitemap data
+            cursor.execute("DELETE FROM sitemap")  # Clear old sitemap
             inserted_count = 0
             for page in sitemap_data:
                 try:
-                    cursor.execute("""
-                        INSERT INTO sitemap (url, title, content, parent_url, depth)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (page['url'], page['title'], page['content'],
-                         page['parent_url'], page['depth']))
+                    cursor.execute(
+                        "INSERT INTO sitemap (url, title, content, parent_url, depth) VALUES (?, ?, ?, ?, ?)",
+                        (page['url'], page['title'], page['content'], 
+                         page.get('parent_url'), page.get('depth', 0))
+                    )
                     inserted_count += 1
-                except sqlite3.Error as db_error:
-                    logger.error(f"Database error inserting sitemap page {page['url']}: {db_error}")
+                except Exception as db_error:
+                    logger.warning(f"Failed to insert page {page.get('url', 'unknown')}: {db_error}")
                     continue
-                    
+            
             conn.commit()
             logger.info(f"Inserted {inserted_count} new sitemap entries into DB.")
 
         return {
-            "message": "Sitemap generated and saved successfully", 
-            "pages_found": len(sitemap_data), 
+            "message": "Sitemap generated and goals suggested successfully",
+            "pages_found": len(sitemap_data),
             "pages_saved_to_db": inserted_count,
-            "suggested_goals": suggested_goals  # <-- Return the suggested goals
+            "suggested_goals": suggested_goals
         }
 
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
     except Exception as e:
-        logger.error(f"Error generating sitemap for {domain}: {e}")
+        logger.error(f"Error generating sitemap for {domain}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to generate sitemap: {str(e)}")
 
 @app.post("/api/chat")
@@ -912,48 +876,6 @@ async def chat(message: ChatMessage):
 
 
     return {"response": bot_response}
-
-@app.post("/api/collect-customer-info")
-async def collect_customer_info(info: CustomerInfo):
-    """Collect customer information"""
-    logger.info(f"Collecting customer info for session {info.session_id}")
-    try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            # Check if info for this session_id already exists
-            cursor.execute("SELECT id FROM customer_info WHERE session_id = ?", (info.session_id,))
-            existing_info = cursor.fetchone()
-
-            if existing_info:
-                # Update existing record
-                 cursor.execute("""
-                     UPDATE customer_info
-                     SET name = COALESCE(?, name),
-                         email = COALESCE(?, email),
-                         phone = COALESCE(?, phone),
-                         additional_info = COALESCE(?, additional_info),
-                         collected_date = CURRENT_TIMESTAMP
-                     WHERE session_id = ?
-                 """, (info.name, info.email, info.phone, info.additional_info, info.session_id))
-                 message = "Customer information updated successfully"
-            else:
-                # Insert new record
-                cursor.execute("""
-                    INSERT INTO customer_info (session_id, name, email, phone, additional_info)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (info.session_id, info.name, info.email, info.phone, info.additional_info))
-                message = "Customer information collected successfully"
-
-            conn.commit()
-
-        return {"message": message}
-
-    except sqlite3.Error as e:
-        logger.error(f"Error collecting customer info: {e}")
-        raise HTTPException(status_code=500, detail=f"Database error collecting customer info: {e}")
-    except Exception as e:
-        logger.error(f"Unexpected error collecting customer info: {e}")
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
 @app.post("/api/configure-bot")
 async def configure_bot(config: BotConfig):
