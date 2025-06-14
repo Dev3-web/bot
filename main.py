@@ -382,10 +382,10 @@ async def scrape_page(browser: Browser, url: str, depth: int = 0) -> Dict:
         })
         
         # Navigate to page with timeout
-        await page.goto(url, wait_until='domcontentloaded', timeout=200)
+        await page.goto(url, wait_until='domcontentloaded', timeout=20000)
         
         # Wait for content to load
-        await page.wait_for_timeout(200)
+        await page.wait_for_timeout(20000)
         
         # Extract page title
         title = await page.title()
@@ -479,7 +479,7 @@ async def extract_links(browser: Browser, url: str, base_domain: str) -> List[st
     links = []
     
     try:
-        await page.goto(url, wait_until='domcontentloaded', timeout=200)
+        await page.goto(url, wait_until='domcontentloaded', timeout=20000)
         
         # Extract all links
         link_elements = await page.query_selector_all('a[href]')
