@@ -1227,12 +1227,12 @@ async def widget_interface(domain: str = None):
                 height: 100vh;
                 display: flex;
                 flex-direction: column;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                background: linear-gradient(135deg, #000412 0%, #000412 100%);
                 color: #333;
             }
             
             .header {
-                background: rgba(255, 255, 255, 0.95);
+                background: rgba(255, 255, 255, 0.01);
                 backdrop-filter: blur(10px);
                 padding: 15px 20px;
                 border-bottom: 1px solid rgba(0, 0, 0, 0.1);
@@ -1257,6 +1257,7 @@ async def widget_interface(domain: str = None):
                 font-size: 16px;
                 font-weight: 600;
                 margin-bottom: 2px;
+                color: white;
             }
             
             .status {
@@ -1391,18 +1392,20 @@ async def widget_interface(domain: str = None):
             }
             
             .input-container {
-                background: rgba(255, 255, 255, 0.95);
+                background: rgba(255, 255, 255, 0.01);
                 backdrop-filter: blur(10px);
                 padding: 16px 20px;
                 border-top: 1px solid rgba(0, 0, 0, 0.1);
                 display: flex;
-                gap: 12px;
-                align-items: flex-end;
+                flex-direction: row;
+                align-items: center;
             }
             
             .input-wrapper {
+               display: flex;
                 flex: 1;
-                position: relative;
+                gap: 12px;
+                align-items: center;
             }
             
             .message-input {
@@ -1417,7 +1420,7 @@ async def widget_interface(domain: str = None):
                 resize: none;
                 outline: none;
                 transition: all 0.2s ease;
-                background: white;
+                background: rgb(229, 222, 222);
             }
             
             .message-input:focus {
@@ -1534,7 +1537,7 @@ async def widget_interface(domain: str = None):
             </div>
         </div>
         
-        <div class="input-container">
+        <div class="input-container ">
             <div class="input-wrapper">
                 <textarea 
                     id="messageInput" 
@@ -1542,12 +1545,12 @@ async def widget_interface(domain: str = None):
                     placeholder="Type your message..." 
                     rows="1"
                 ></textarea>
+                <button class="send-button" id="sendButton" onclick="sendMessage()">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M2,21L23,12L2,3V10L17,12L2,14V21Z" />
+                    </svg>
+                </button>
             </div>
-            <button class="send-button" id="sendButton" onclick="sendMessage()">
-                <svg viewBox="0 0 24 24" fill="currentColor">
-                    <path d="M2,21L23,12L2,3V10L17,12L2,14V21Z" />
-                </svg>
-            </button>
         </div>
         
         <script>
