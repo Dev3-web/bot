@@ -30,6 +30,7 @@ import asyncio
 from playwright.async_api import async_playwright, Browser, Page
 import gc
 from pathlib import Path
+import subprocess
 
 # --- Langchain / RAG Imports ---
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
@@ -43,14 +44,6 @@ from langchain_core.documents import Document # For creating Langchain Document 
 # --- Environment Variables ---
 from dotenv import load_dotenv
 load_dotenv() # Load environment variables from .env file
-
-import subprocess
-
-async def ensure_playwright_installed():
-    subprocess.run(["python", "-m", "playwright", "install"], check=True)
-
-asyncio.run(ensure_playwright_installed())
-
 
 # Ensure OpenAI API key is set
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -78,6 +71,11 @@ DATABASE_FILE = "nav_bot.db"
 chroma_client = None
 rag_chain = None
 CHROMA_DB_PATH = "./chroma_db"
+
+async def ensure_playwright_installed():
+    subprocess.run(["python", "-m", "playwright", "install"], check=True)
+
+asyncio.run(ensure_playwright_installed())
 
 def suggest_goals_from_content(sitemap_data: List[Dict]) -> List[str]:
     """
