@@ -25,7 +25,7 @@ st.set_page_config(
 )
 
 # Backend API URL
-API_BASE_URL = "https://bot-1-gptw.onrender.com"
+API_BASE_URL = "https://bot-ehff.onrender.com"
 
 # Custom CSS for better styling
 st.markdown("""
@@ -184,13 +184,6 @@ def step1_upload_sources():
 def step2_generate_sitemap():
     """Step 2: Generate sitemap automatically"""
     st.markdown('<div class="step-header"><h2>🗺️ Step 2: Generate Website Sitemap & Goals</h2></div>', unsafe_allow_html=True)
-
-    st.markdown("""
-    <div class="info-box">
-    <strong>What this does:</strong> Our AI-powered crawler (Firecrawl) will analyze your website to understand its structure.
-    It will then use this data to automatically suggest user goals for your bot.
-    </div>
-    """, unsafe_allow_html=True)
 
     domain = st.text_input(
         "Enter your website domain",

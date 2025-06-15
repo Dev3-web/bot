@@ -40,9 +40,6 @@ from langchain.chains import RetrievalQA
 from langchain_openai import ChatOpenAI # Or use another LLM via langchain_community
 from langchain_core.documents import Document # For creating Langchain Document objects
 
-# --- NEW: Firecrawl Import ---
-from firecrawl import FirecrawlApp
-
 # --- Environment Variables ---
 from dotenv import load_dotenv
 load_dotenv() # Load environment variables from .env file
@@ -51,10 +48,6 @@ load_dotenv() # Load environment variables from .env file
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     logger.error("OPENAI_API_KEY environment variable not set!")
-
-FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
-if not FIRECRAWL_API_KEY:
-    logger.error("FIRECRAWL_API_KEY environment variable not set!")
 
 
 # Configure logging
