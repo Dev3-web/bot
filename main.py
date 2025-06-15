@@ -44,6 +44,14 @@ from langchain_core.documents import Document # For creating Langchain Document 
 from dotenv import load_dotenv
 load_dotenv() # Load environment variables from .env file
 
+import subprocess
+
+async def ensure_playwright_installed():
+    subprocess.run(["python", "-m", "playwright", "install"], check=True)
+
+asyncio.run(ensure_playwright_installed())
+
+
 # Ensure OpenAI API key is set
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
