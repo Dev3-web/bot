@@ -1993,6 +1993,7 @@ async def get_status():
     }
 
 if __name__ == "__main__":
-    PORT = 8000
+    import os
+    PORT = int(os.environ.get("PORT", 8000))
     os.makedirs(CHROMA_DB_PATH, exist_ok=True)
     uvicorn.run(app, host="0.0.0.0", port=PORT)
