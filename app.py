@@ -14,6 +14,7 @@ import base64
 from io import BytesIO
 import re
 from typing import List, Dict, Set
+import urllib.parse
 import sqlite3
 
 # Configure Streamlit page
@@ -670,6 +671,18 @@ def step6_deploy_widget():
                     mime="text/html"
                 )
 
+                st.divider()
+
+                st.subheader("Option 2: Download Self-Hosted Package (Advanced)")
+                st.markdown("<div class='warning-box'>Use this option to download a complete, self-contained bot package that you can run on your own server. This includes the backend server code, your configured database, and your entire knowledge base.</div>", unsafe_allow_html=True)
+                
+                try:
+                    encoded_domain = urllib.parse.quote(domain)
+                    download_url = f"{API_BASE_URL}/api/export-bot/{encoded_domain}"
+                    st.markdown(f'<a href="{download_url}" target="_blank"><button>⬇️ Download Self-Hosted Bot Package</button></a>', unsafe_allow_html=True)
+                    st.info("After downloading, unzip the package and follow the instructions in `README.md` to deploy your bot.")
+                except Exception as e:
+                    st.error(f"Could not generate download link: {e}")
                 # Installation instructions
                 with st.expander("📖 Installation Instructions"):
                     st.markdown("""
