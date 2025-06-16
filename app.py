@@ -25,7 +25,7 @@ st.set_page_config(
 )
 
 # Backend API URL
-API_BASE_URL = "https://bot-1zoe.onrender.com"
+API_BASE_URL = "http://127.0.0.1:8000"
 
 # Custom CSS for better styling
 st.markdown("""

@@ -72,10 +72,10 @@ chroma_client = None
 rag_chain = None
 CHROMA_DB_PATH = "./chroma_db"
 
-async def ensure_playwright_installed():
-    subprocess.run(["python", "-m", "playwright", "install"], check=True)
+# def ensure_playwright_installed():
+#     subprocess.run(["python", "-m", "playwright", "install"], check=True)
 
-asyncio.run(ensure_playwright_installed())
+# asyncio.run(ensure_playwright_installed())
 
 def suggest_goals_from_content(sitemap_data: List[Dict]) -> List[str]:
     """
