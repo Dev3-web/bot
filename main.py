@@ -22,24 +22,24 @@ import logging
 import shutil
 import time
 import random
-import logging as logger
+import logging as logger # Using logger for consistency
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import re
 import asyncio
-from playwright.async_api import async_playwright, Browser, Page
+import sys
 import gc
 from pathlib import Path
-import subprocess
+import aiohttp
 
 # --- Langchain / RAG Imports ---
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import OpenAIEmbeddings # Or use HuggingFaceEmbeddings
+from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain.chains import RetrievalQA
-from langchain_openai import ChatOpenAI # Or use another LLM via langchain_community
-from langchain_core.documents import Document # For creating Langchain Document objects
+from langchain_openai import ChatOpenAI
+from langchain_core.documents import Document
 
 # --- Environment Variables ---
 from dotenv import load_dotenv
@@ -57,6 +57,11 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Navigation Helper Bot API (RAG Enabled)", version="2.0.0")
 
+if sys.platform == "win32":
+    # Use ProactorEventLoopPolicy on Windows for better async compatibility
+    # This must be set before any asyncio loop is created, ideally at the very beginning
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -71,11 +76,6 @@ DATABASE_FILE = "nav_bot.db"
 chroma_client = None
 rag_chain = None
 CHROMA_DB_PATH = "./chroma_db"
-
-# def ensure_playwright_installed():
-#     subprocess.run(["python", "-m", "playwright", "install"], check=True)
-
-# asyncio.run(ensure_playwright_installed())
 
 def suggest_goals_from_content(sitemap_data: List[Dict]) -> List[str]:
     """
@@ -128,9 +128,34 @@ def init_database():
             content TEXT,
             parent_url TEXT,
             depth INTEGER DEFAULT 0,
+            description TEXT,           -- New field
+            keywords TEXT,              -- New field
+            og_title TEXT,              -- New field
+            og_description TEXT,        -- New field
+            og_image TEXT,              -- New field
+            publication_date TIMESTAMP, -- New field
             created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+
+    # Add new columns if they don't exist (for existing databases)
+    def add_column_if_not_exists(table_name, column_name, column_type):
+        try:
+            cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+            logger.info(f"Added column '{column_name}' to table '{table_name}'.")
+        except sqlite3.OperationalError as e:
+            if f"duplicate column name: {column_name}" in str(e):
+                logger.debug(f"Column '{column_name}' already exists in table '{table_name}'.")
+            else:
+                logger.error(f"Error adding column '{column_name}' to table '{table_name}': {e}")
+
+    add_column_if_not_exists('sitemap', 'description', 'TEXT')
+    add_column_if_not_exists('sitemap', 'keywords', 'TEXT')
+    add_column_if_not_exists('sitemap', 'og_title', 'TEXT')
+    add_column_if_not_exists('sitemap', 'og_description', 'TEXT')
+    add_column_if_not_exists('sitemap', 'og_image', 'TEXT')
+    add_column_if_not_exists('sitemap', 'publication_date', 'TIMESTAMP')
+
 
     # Bot configurations table
     cursor.execute('''
@@ -278,17 +303,11 @@ def add_document_to_rag(file_content: bytes, filename: str, file_type: str):
             return False
 
         # Add chunks to vector store
-        # We need access to the underlying vectorstore, not just the chain
-        # Re-initialize vectorstore here just to get the instance connected to the path
-        # A better way in a larger app is to pass the vectorstore instance around or make it part of the RAGSystem class
         embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
         vectorstore = Chroma(persist_directory=CHROMA_DB_PATH, embedding_function=embeddings)
 
         logger.info(f"Adding {len(split_docs)} chunks to Chroma DB...")
-        # Add metadata to chunks if desired (e.g., filename, source page)
-        # Langchain loaders often add source/page metadata automatically
-        # vectorstore.add_documents([Document(page_content=chunk.page_content, metadata={'source': filename}) for chunk in split_docs])
-        vectorstore.add_documents(split_docs) # Loaders usually add relevant metadata
+        vectorstore.add_documents(split_docs)
         logger.info("Chunks added successfully.")
 
         os.remove(temp_filepath) # Clean up temp file
@@ -330,7 +349,10 @@ def add_website_content_to_rag(sitemap_data: List[Dict]):
                 page_content=page['content'],
                 metadata={
                     "source": page['url'],
-                    "title": page.get('title', 'Untitled')
+                    "title": page.get('title', 'Untitled'),
+                    "description": page.get('description'),
+                    "og_title": page.get('og_title'),
+                    "og_description": page.get('og_description'),
                 }
             )
             langchain_docs.append(doc)
@@ -353,11 +375,11 @@ def add_website_content_to_rag(sitemap_data: List[Dict]):
     try:
         embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
         vectorstore = Chroma(persist_directory=CHROMA_DB_PATH, embedding_function=embeddings)
-        
+
         logger.info(f"Adding {len(split_docs)} website content chunks to Chroma DB...")
         vectorstore.add_documents(split_docs)
         logger.info("Website content chunks added to RAG successfully.")
-        
+
         return len(split_docs) # Return the number of chunks added
 
     except Exception as e:
@@ -368,256 +390,240 @@ def generate_file_hash(content: bytes) -> str:
     """Generate SHA-256 hash of file content"""
     return hashlib.sha256(content).hexdigest()
 
-async def crawl_with_playwright(url: str, max_pages: int = 25, concurrency: int = 10) -> List[Dict]:
+async def crawl_website_aiohttp(url: str, max_pages: int = 110, max_concurrent: int = 10) -> List[Dict]:
     """
-    Crawls a website in parallel using Playwright and asyncio.
+    Crawls website using aiohttp for Windows compatibility.
     """
-    if not url.startswith(('http://', 'https://')):
-        url = f'https://{url}'
+    normalized_url = url if url.startswith(('http://', 'https://')) else f'https://{url}'
+    base_domain = urlparse(normalized_url).netloc
 
-    logger.info(f"Starting PARALLEL Playwright crawl for URL: {url} with concurrency {concurrency}.")
+    logger.info(f"Starting aiohttp-based crawl for: {normalized_url} (max_concurrent: {max_concurrent})")
 
-    crawled_pages = []
-    urls_to_visit = deque([url])
-    visited_urls = {url}
-    base_domain = urlparse(url).netloc
+    discovered_pages = []
+    urls_to_visit = deque([normalized_url])
+    visited_urls = {normalized_url}
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        
-        while urls_to_visit and len(crawled_pages) < max_pages:
-            # Create a batch of tasks to run in parallel
-            tasks = []
-            batch_size = min(len(urls_to_visit), concurrency, max_pages - len(crawled_pages))
-            
-            for _ in range(batch_size):
-                current_url = urls_to_visit.popleft()
-                # Create a task to scrape one page and find its links
-                tasks.append(scrape_and_find_links(browser, current_url, base_domain))
+    # Create aiohttp session with proper configuration
+    timeout = aiohttp.ClientTimeout(total=30, connect=10)
+    connector = aiohttp.TCPConnector(limit=max_concurrent, limit_per_host=max_concurrent)
 
-            # Run the batch of tasks concurrently
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # Process the results of the batch
-            for res in results:
-                if isinstance(res, Exception) or not res:
-                    continue # Skip failed crawls
-                
-                page_data, new_links = res
-                if page_data and page_data['url'] not in [p['url'] for p in crawled_pages]:
-                    crawled_pages.append(page_data)
-
-                # Add newly found, unvisited links to the queue
-                for link in new_links:
-                    if link not in visited_urls:
-                        visited_urls.add(link)
-                        urls_to_visit.append(link)
-        
-        await browser.close()
-
-    logger.info(f"Parallel crawling completed. Found {len(crawled_pages)} pages.")
-    return crawled_pages
-
-async def scrape_page(browser: Browser, url: str, depth: int = 0) -> Dict:
-    """
-    Scrape a single page using Playwright.
-    """
-    page = await browser.new_page()
-
-    try:
-        # Set user agent to avoid bot detection
-        await page.set_extra_http_headers({
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        connector=connector,
+        headers={
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        })
-
-        # Navigate to page with timeout
-        await page.goto(url, wait_until='domcontentloaded', timeout=20000)
-
-        # Wait for content to load
-        await page.wait_for_timeout(20000)
-
-        # Extract page title
-        title = await page.title()
-
-        # Extract main content
-        content = await extract_main_content(page)
-
-        # Get page URL (in case of redirects)
-        final_url = page.url
-
-        return {
-            'url': final_url,
-            'title': title or 'Untitled',
-            'content': content,
-            'depth': depth,
-            'parent_url': None  # You can track parent URLs if needed
         }
+    ) as session:
 
+        while urls_to_visit and len(discovered_pages) < max_pages:
+            # Create batch of URLs to process
+            batch_urls = []
+            batch_size = min(len(urls_to_visit), max_concurrent, max_pages - len(discovered_pages))
+
+            for _ in range(batch_size):
+                if urls_to_visit:
+                    batch_urls.append(urls_to_visit.popleft())
+
+            if not batch_urls:
+                break # No more URLs to process in this iteration
+
+            # Process batch concurrently
+            tasks = [fetch_page_content(session, url, base_domain) for url in batch_urls]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Process results
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning(f"Error during page fetch: {result}")
+                    continue
+
+                if result:
+                    page_data, new_links = result
+                    if page_data:
+                        discovered_pages.append(page_data)
+
+                        # Add new URLs to visit
+                        for link in new_links:
+                            # Basic URL normalization (remove query params and fragments) for deduplication
+                            parsed_link = urlparse(link)
+                            clean_link = urlunparse(parsed_link._replace(query='', fragment=''))
+                            if clean_link not in visited_urls and len(discovered_pages) < max_pages:
+                                visited_urls.add(clean_link)
+                                urls_to_visit.append(clean_link)
+
+            # Small delay to be respectful to the server
+            await asyncio.sleep(0.1)
+
+    logger.info(f"aiohttp crawling finished. Collected {len(discovered_pages)} pages.")
+    return discovered_pages
+
+
+async def fetch_page_content(session: aiohttp.ClientSession, url: str, base_domain: str) -> Optional[tuple]:
+    """
+    Fetches a single page content and extracts links and richer metadata.
+    """
+    try:
+        async with session.get(url) as response:
+            if response.status != 200:
+                logger.warning(f"HTTP {response.status} for {url}")
+                return None
+
+            # Check content type
+            content_type = response.headers.get('content-type', '').lower()
+            if 'text/html' not in content_type and not content_type.startswith('text/html'):
+                logger.warning(f"Skipping non-HTML content: {url} (Content-Type: {content_type})")
+                return None
+
+            html_content = await response.text(encoding='utf-8', errors='ignore')
+
+            # Parse with BeautifulSoup
+            soup = BeautifulSoup(html_content, 'html.parser')
+
+            # --- Extract Metadata ---
+            page_title = (soup.find('title').get_text().strip() if soup.find('title') else
+                          soup.find('meta', property='og:title').get('content', '').strip() if soup.find('meta', property='og:title') else
+                          'Untitled')
+
+            page_description = (soup.find('meta', attrs={'name': 'description'}).get('content', '').strip()
+                                if soup.find('meta', attrs={'name': 'description'}) else
+                                soup.find('meta', property='og:description').get('content', '').strip()
+                                if soup.find('meta', property='og:description') else None)
+
+            page_keywords = (soup.find('meta', attrs={'name': 'keywords'}).get('content', '').strip()
+                             if soup.find('meta', attrs={'name': 'keywords'}) else None)
+
+            og_title = soup.find('meta', property='og:title').get('content', '').strip() if soup.find('meta', property='og:title') else None
+            og_description = soup.find('meta', property='og:description').get('content', '').strip() if soup.find('meta', property='og:description') else None
+            og_image = soup.find('meta', property='og:image').get('content', '').strip() if soup.find('meta', property='og:image') else None
+
+            publication_date = None
+            time_tag = soup.find('time', datetime=True)
+            if time_tag:
+                try:
+                    publication_date = datetime.fromisoformat(time_tag['datetime']).isoformat()
+                except ValueError:
+                    pass # Invalid datetime format
+
+            # --- Extract Main Content ---
+            # Remove script and style elements, and common boilerplate sections
+            for script in soup(["script", "style", "nav", "header", "footer", "aside", ".sidebar", ".ad", ".social-share", ".wp-block-comments", ".comments", "#comments"]):
+                script.decompose()
+
+            # Prioritize main content areas
+            main_content_elements = soup.find_all(['main', 'article', 'div'], class_=['content', 'post-content', 'entry-content', 'main-content'])
+            page_content = ""
+            for elem in main_content_elements:
+                text = elem.get_text(separator=' ', strip=True)
+                if len(text) > 100: # Only use if it seems like substantial content
+                    page_content = text
+                    break
+            
+            # Fallback to body content if specific main content wasn't found or was too short
+            if not page_content:
+                page_content = soup.get_text(separator=' ', strip=True)
+
+            # Clean up text
+            page_content = re.sub(r'\s+', ' ', page_content).strip()[:5000] # Limit content length for RAG
+
+            # --- Extract Internal Links ---
+            internal_links = []
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                full_url = urljoin(url, href)
+                parsed_url = urlparse(full_url)
+
+                # Skip non-http/https links, mailto, tel etc.
+                if parsed_url.scheme not in ('http', 'https'):
+                    continue
+
+                # Check if it's an internal link and not a file download
+                if parsed_url.netloc == base_domain and not re.search(r'\.(pdf|docx|xlsx|pptx|zip|rar|exe|jpg|png|gif|svg)$', parsed_url.path.lower()):
+                    # Clean URL (remove fragments and query params for deduplication)
+                    clean_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+                    if clean_url not in internal_links and clean_url != url: # Avoid self-referencing
+                        internal_links.append(clean_url)
+
+            page_data = {
+                'url': url,
+                'title': page_title,
+                'content': page_content,
+                'depth': urlparse(url).path.count('/'),
+                'parent_url': None, # This could be tracked if desired in a more complex crawler
+                'description': page_description,
+                'keywords': page_keywords,
+                'og_title': og_title,
+                'og_description': og_description,
+                'og_image': og_image,
+                'publication_date': publication_date,
+            }
+
+            return page_data, internal_links[:20] # Limit links to avoid excessive queueing
+
+    except asyncio.TimeoutError:
+        logger.warning(f"Timeout fetching {url}")
+        return None
     except Exception as e:
-        logger.error(f"Error scraping page {url}: {e}")
+        logger.warning(f"Error fetching {url}: {e}")
         return None
 
-    finally:
-        await page.close()
-        
-async def scrape_and_find_links(browser: Browser, url: str, base_domain: str):
-    """A helper task that scrapes a page and finds links on it."""
-    try:
-        # Reuse your existing scraping logic
-        page_data = await scrape_page(browser, url, 0) # Depth can be managed if needed
-        if not page_data:
-            return None, []
-        
-        # Reuse your existing link extraction logic
-        new_links = await extract_links(browser, url, base_domain)
-        
-        return page_data, new_links
-    except Exception as e:
-        logger.warning(f"Error in worker for {url}: {e}")
-        return None, []
 
-async def extract_main_content(page: Page) -> str:
+async def save_sitemap_to_database(sitemap_data: List[Dict]) -> int:
     """
-    Extract main content from a page, filtering out navigation, ads, etc.
+    Saves sitemap data to database with improved error handling.
     """
-    try:
-        # Try to get main content using common selectors
-        main_selectors = [
-            'main',
-            'article',
-            '.main-content',
-            '.content',
-            '#main',
-            '#content',
-            '.post-content',
-            '.entry-content'
-        ]
+    saved_count = 0
 
-        content_text = ""
+    # Run database operations in a thread to avoid blocking
+    def save_to_db():
+        nonlocal saved_count
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
 
-        # Try each selector to find main content
-        for selector in main_selectors:
-            try:
-                element = await page.query_selector(selector)
-                if element:
-                    content_text = await element.inner_text()
-                    if content_text and len(content_text.strip()) > 100:
-                        break
-            except:
-                continue
+                # Clear existing sitemap data
+                cursor.execute("DELETE FROM sitemap")
+                logger.info("Cleared existing sitemap data.")
 
-        # If no main content found, get body content and filter
-        if not content_text or len(content_text.strip()) < 100:
-            # Get all text content
-            content_text = await page.evaluate('''
-                () => {
-                    // Remove script and style elements
-                    const scripts = document.querySelectorAll('script, style, nav, header, footer, aside, .nav, .navigation, .menu, .sidebar');
-                    scripts.forEach(el => el.remove());
+                # Insert new data
+                for page_info in sitemap_data:
+                    try:
+                        cursor.execute(
+                            """INSERT INTO sitemap (
+                                url, title, content, parent_url, depth,
+                                description, keywords, og_title, og_description, og_image, publication_date
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                page_info['url'],
+                                page_info['title'],
+                                page_info['content'],
+                                page_info.get('parent_url'),
+                                page_info.get('depth', 0),
+                                page_info.get('description'),
+                                page_info.get('keywords'),
+                                page_info.get('og_title'),
+                                page_info.get('og_description'),
+                                page_info.get('og_image'),
+                                page_info.get('publication_date')
+                            )
+                        )
+                        saved_count += 1
 
-                    // Get body text
-                    return document.body.innerText || document.body.textContent || '';
-                }
-            ''')
+                    except Exception as db_error:
+                        logger.warning(f"Database insert failed for {page_info.get('url', 'unknown')}: {db_error}")
+                        continue
 
-        # Clean up the content
-        content_text = clean_content(content_text)
+                conn.commit()
+                logger.info(f"Database transaction committed. {saved_count} records saved.")
+        except Exception as e:
+            logger.error(f"Database operation failed: {e}")
 
-        # Limit content length to avoid huge texts
-        if len(content_text) > 5000:
-            content_text = content_text[:5000] + "..."
+    # Run in thread pool to avoid blocking
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, save_to_db)
 
-        print("Content extracted:", content_text)
-        return content_text
+    return saved_count
 
-    except Exception as e:
-        logger.error(f"Error extracting content: {e}")
-        return ""
-
-async def extract_links(browser: Browser, url: str, base_domain: str) -> List[str]:
-    """
-    Extract all internal links from a page.
-    """
-    page = await browser.new_page()
-    links = []
-
-    try:
-        await page.goto(url, wait_until='domcontentloaded', timeout=20000)
-
-        # Extract all links
-        link_elements = await page.query_selector_all('a[href]')
-
-        for link_element in link_elements:
-            href = await link_element.get_attribute('href')
-            if href:
-                # Convert relative URLs to absolute
-                absolute_url = urljoin(url, href)
-
-                # Check if link is internal and valid
-                if is_valid_internal_link(absolute_url, base_domain):
-                    links.append(absolute_url)
-
-    except Exception as e:
-        logger.error(f"Error extracting links from {url}: {e}")
-
-    finally:
-        await page.close()
-
-    print("Extracted links:", links)
-    return list(set(links))  # Remove duplicates
-
-def is_valid_internal_link(url: str, base_domain: str) -> bool:
-    """
-    Check if a URL is a valid internal link.
-    """
-    try:
-        parsed = urlparse(url)
-
-        # Must be same domain
-        if parsed.netloc != base_domain:
-            return False
-
-        # Skip certain file types and paths
-        excluded_extensions = ['.pdf', '.jpg', '.jpeg', '.png', '.gif', '.css', '.js', '.xml', '.zip']
-        excluded_paths = ['/feed/', '/rss/', '/admin/', '/wp-admin/', '/wp-content/', '/wp-includes/']
-
-        path = parsed.path.lower()
-
-        # Check extensions
-        for ext in excluded_extensions:
-            if path.endswith(ext):
-                return False
-
-        # Check paths
-        for excluded_path in excluded_paths:
-            if excluded_path in path:
-                return False
-
-        return True
-
-    except Exception:
-        return False
-
-def clean_content(text: str) -> str:
-    """
-    Clean and normalize extracted text content.
-    """
-    if not text:
-        return ""
-
-    # Remove extra whitespace
-    text = re.sub(r'\s+', ' ', text)
-
-    # Remove common unwanted patterns
-    text = re.sub(r'Skip to.*?content', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'Cookie.*?policy', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'Privacy.*?policy', '', text, flags=re.IGNORECASE)
-
-    # Remove multiple consecutive periods or dashes
-    text = re.sub(r'[.]{3,}', '...', text)
-    text = re.sub(r'[-]{3,}', '---', text)
-
-    return text.strip()
 
 def generate_goals_with_ai(crawled_data: List[Dict]) -> List[str]:
     """
@@ -636,17 +642,19 @@ def generate_goals_with_ai(crawled_data: List[Dict]) -> List[str]:
     # Combine content from the first few pages to create a context for the LLM
     # We limit this to avoid exceeding token limits
     context = ""
-    for i, page in enumerate(crawled_data[:5]): # Use up to the first 5 pages
+    # Use first 5 pages for context, prioritize pages with content
+    relevant_pages = [p for p in crawled_data if p.get('content')]
+    for i, page in enumerate(relevant_pages[:5]): # Use up to the first 5 relevant pages
         context += f"--- Page {i+1}: {page.get('title', '')} ---\n"
         context += page.get('content', '')[:2000] # Limit content per page
         context += "\n\n"
 
     if not context.strip():
-        logger.warning("Could not extract any content to send to AI.")
+        logger.warning("Could not extract any content to send to AI for goal generation.")
         return []
 
     # Define the prompt for the AI
-    logger.info("Creating AI prompt for goal generation...", context)
+    logger.debug(f"Creating AI prompt for goal generation with context length: {len(context)}")
     prompt = f"""
     You are an expert in user experience and marketing strategy. Your task is to analyze the content of a website and suggest the most common user goals or "jobs to be done".
 
@@ -691,7 +699,7 @@ async def cleanup_chroma_db(chroma_db_path: str, max_retries: int = 3) -> bool:
     Returns True if successful, False otherwise.
     """
     global chroma_client
-    
+
     # Close any existing connections
     if chroma_client:
         try:
@@ -700,13 +708,13 @@ async def cleanup_chroma_db(chroma_db_path: str, max_retries: int = 3) -> bool:
         except:
             pass
         chroma_client = None
-    
+
     gc.collect()
-    
+
     path = Path(chroma_db_path)
     if not path.exists():
         return True
-    
+
     for attempt in range(max_retries):
         try:
             if attempt == 0:
@@ -733,14 +741,15 @@ async def cleanup_chroma_db(chroma_db_path: str, max_retries: int = 3) -> bool:
                 path.rename(backup_name)
                 path.mkdir(parents=True, exist_ok=True)
                 return True
-                
+
         except Exception as e:
             logger.warning(f"ChromaDB cleanup attempt {attempt + 1} failed: {e}")
             if attempt < max_retries - 1:
                 await asyncio.sleep(1)
                 gc.collect()
-    
+
     return False
+
 class ChatMessage(BaseModel):
     message: str
     session_id: str
@@ -751,6 +760,7 @@ class CustomerInfo(BaseModel):
     email: Optional[str] = None
     phone: Optional[str] = None
     additional_info: Optional[str] = None
+
 class BotConfig(BaseModel):
     domain: str
     widget_position: str = "bottom-right"
@@ -879,87 +889,75 @@ async def upload_documents(files: List[UploadFile] = File(...)):
 @app.post("/api/generate-sitemap")
 async def generate_sitemap(request: SitemapRequest):
     """
-    Generate sitemap using Playwright and suggest user goals using AI.
+    Generate sitemap using aiohttp-based crawler (Windows-compatible).
     """
     domain = request.domain
-    logger.info(f"Starting sitemap and goal generation for domain: {domain}")
+    logger.info(f"Initiating sitemap generation for domain: {domain}")
 
     try:
-        # await clear_knowledge_base()
-        logger.info("Cleared previous knowledge base to prepare for new crawl data.")
-        # Step 1: Crawl the website using Playwright
-        sitemap_data = await crawl_with_playwright(domain, max_pages=110)
-        logger.info(f"Finished crawling. Found {len(sitemap_data)} pages.")
+        # Clear previous data
+        logger.info("Preparing knowledge base for new crawl session.")
 
-        if not sitemap_data:
-            # More specific error handling
-            logger.warning(f"No pages found for domain: {domain}")
+        # Step 1: Crawl website using aiohttp approach
+        crawl_results = await crawl_website_aiohttp(domain, max_pages=110)
+        logger.info(f"Crawl completed. Retrieved {len(crawl_results)} pages.")
 
-            # Try to provide more helpful error information
-            if not domain.startswith(('http://', 'https://')):
-                test_url = f'https://{domain}'
-            else:
-                test_url = domain
+        if not crawl_results:
+            logger.warning(f"Zero pages discovered for domain: {domain}")
+
+            # Construct test URL for better error messaging
+            test_domain = domain if domain.startswith(('http://', 'https://')) else f'https://{domain}'
 
             raise HTTPException(
                 status_code=404,
-                detail=f"No pages found for {domain}. Please check if the website is accessible at {test_url} and allows crawling."
+                detail=f"Unable to crawl {domain}. Verify the website is reachable at {test_domain} and permits crawling."
             )
-            
-        # Step 2: Generate goal suggestions using AI
-        logger.info("data ----------------------------", sitemap_data)
-        chunks_added_to_rag = add_website_content_to_rag(sitemap_data)
-        if chunks_added_to_rag > 0:
-            logger.info(f"Successfully added {chunks_added_to_rag} content chunks to the RAG vector store.")
+
+        # Step 2: Process content for RAG system
+        logger.info("Processing crawled content for RAG integration.")
+        rag_chunks = add_website_content_to_rag(crawl_results)
+
+        if rag_chunks > 0:
+            logger.info(f"Added {rag_chunks} content chunks to RAG vector store.")
         else:
-            logger.warning("Could not add any website content to the RAG system.")
-        suggested_goals = generate_goals_with_ai(sitemap_data)
-        if not suggested_goals:
-            logger.warning("AI goal generation failed. Falling back to keyword-based suggestions.")
-            suggested_goals = suggest_goals_from_content(sitemap_data)
-        logger.info(f"Final suggested goals: {suggested_goals}")
-        
-        # Fallback to keyword-based suggestions if AI fails or returns nothing
-        if not suggested_goals:
-            logger.warning("AI goal generation failed or returned no goals. Falling back to keyword-based suggestions.")
-            suggested_goals = suggest_goals_from_content(sitemap_data)
+            logger.warning("RAG integration failed - no content chunks added.")
 
-        logger.info(f"Final suggested goals: {suggested_goals}")
+        # Step 3: Generate AI-powered goal suggestions
+        logger.info("Generating AI-powered goal suggestions.")
+        ai_goals = generate_goals_with_ai(crawl_results)
 
-        # Step 3: Save the sitemap to the database
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM sitemap")  # Clear old sitemap
-            inserted_count = 0
-            for page in sitemap_data:
-                try:
-                    cursor.execute(
-                        "INSERT INTO sitemap (url, title, content, parent_url, depth) VALUES (?, ?, ?, ?, ?)",
-                        (page['url'], page['title'], page['content'],
-                         page.get('parent_url'), page.get('depth', 0))
-                    )
-                    inserted_count += 1
-                except Exception as db_error:
-                    logger.warning(f"Failed to insert page {page.get('url', 'unknown')}: {db_error}")
-                    continue
+        # Fallback to keyword-based approach if AI fails
+        final_goals = ai_goals if ai_goals else suggest_goals_from_content(crawl_results)
 
-            conn.commit()
-            logger.info(f"Inserted {inserted_count} new sitemap entries into DB.")
+        if not final_goals:
+            logger.warning("Both AI and keyword-based goal generation failed.")
+            final_goals = ["Improve website engagement", "Enhance user experience"]  # Default goals
+
+        logger.info(f"Generated goals: {final_goals}")
+
+        # Step 4: Persist sitemap data to database
+        db_records_saved = await save_sitemap_to_database(crawl_results)
+        logger.info(f"Persisted {db_records_saved} sitemap records to database.")
 
         return {
-            "message": "Sitemap generated and goals suggested successfully",
-            "pages_found": len(sitemap_data),
-            "pages_saved_to_db": inserted_count,
-            "chunks_added_to_rag": chunks_added_to_rag, 
-            "suggested_goals": suggested_goals
+            "status": "success",
+            "message": "Sitemap generation completed successfully",
+            "metrics": {
+                "pages_discovered": len(crawl_results),
+                "pages_persisted": db_records_saved,
+                "rag_chunks_added": rag_chunks
+            },
+            "suggested_goals": final_goals
         }
 
     except HTTPException:
-        # Re-raise HTTP exceptions as-is
         raise
     except Exception as e:
-        logger.error(f"Error generating sitemap for {domain}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to generate sitemap: {str(e)}")
+        logger.error(f"Sitemap generation failed for {domain}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal error during sitemap generation: {str(e)}"
+        )
 
 @app.post("/api/chat")
 async def chat(message: ChatMessage):
@@ -1029,7 +1027,7 @@ async def configure_bot(config: BotConfig):
 @app.post("/api/verify-dns")
 async def verify_dns(verification: DNSVerification):
     """Verify DNS record for domain (basic check)"""
-    domain = verification.domain.replace('http://', '').replace('https://', '').split('/')[0] 
+    domain = verification.domain.replace('http://', '').replace('https://', '').split('/')[0]
     logger.info(f"Attempting to verify domain: {domain}")
     try:
         response = requests.head(f"https://{domain}", timeout=15, verify=True)
@@ -1778,28 +1776,28 @@ async def get_sitemap():
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT url, title, depth FROM sitemap ORDER BY depth, url")
+            cursor.execute("SELECT url, title, depth, description, og_title, og_image, publication_date FROM sitemap ORDER BY depth, url")
             sitemap = [dict(row) for row in cursor.fetchall()]
         logger.info(f"Returning {len(sitemap)} sitemap entries.")
         return {"sitemap": sitemap}
     except Exception as e:
-         logger.error(f"Error fetching sitemap: {e}") 
+         logger.error(f"Error fetching sitemap: {e}")
          raise HTTPException(status_code=500, detail=f"Error fetching sitemap: {e}")
 
 @app.delete("/api/knowledge-base")
 async def clear_knowledge_base():
     """Deletes all documents metadata from SQLite and clears Chroma DB."""
     global rag_chain, chroma_client
-    
+
     logger.info("Received DELETE request for /api/knowledge-base")
-    
+
     if not rag_chain:
         raise HTTPException(status_code=500, detail="RAG system is not initialized. Cannot clear knowledge base.")
 
     try:
         # Step 1: Properly close existing RAG system and ChromaDB connections
         logger.info("Shutting down existing RAG system connections...")
-        
+
         # Close ChromaDB client if it exists
         if chroma_client:
             try:
@@ -1812,13 +1810,13 @@ async def clear_knowledge_base():
                 logger.warning(f"Error closing ChromaDB client: {e}")
             finally:
                 chroma_client = None
-        
+
         # Reset RAG chain reference
         rag_chain = None
-        
+
         # Force garbage collection to release file handles
         gc.collect()
-        
+
         # Small delay to ensure file handles are released
         await asyncio.sleep(0.1)
 
@@ -1831,13 +1829,13 @@ async def clear_knowledge_base():
 
         # Step 3: Clear Chroma DB directory with robust error handling
         chroma_db_path = Path(CHROMA_DB_PATH)
-        
+
         if chroma_db_path.exists():
             logger.info(f"Clearing Chroma DB directory: {CHROMA_DB_PATH}")
-            
+
             success = False
             max_retries = 3
-            
+
             for attempt in range(max_retries):
                 try:
                     # Method 1: Try direct removal
@@ -1846,11 +1844,11 @@ async def clear_knowledge_base():
                         success = True
                         logger.info("Successfully removed ChromaDB directory (direct method)")
                         break
-                    
+
                     # Method 2: Remove files individually then directory
                     elif attempt == 1:
                         logger.info(f"Attempt {attempt + 1}: Removing files individually...")
-                        
+
                         # Remove all files first
                         for file_path in chroma_db_path.rglob("*"):
                             if file_path.is_file():
@@ -1858,7 +1856,7 @@ async def clear_knowledge_base():
                                     file_path.unlink()
                                 except (PermissionError, OSError) as e:
                                     logger.warning(f"Could not delete file {file_path}: {e}")
-                        
+
                         # Remove empty directories
                         for dir_path in sorted(chroma_db_path.rglob("*"), key=lambda p: len(p.parts), reverse=True):
                             if dir_path.is_dir():
@@ -1866,30 +1864,30 @@ async def clear_knowledge_base():
                                     dir_path.rmdir()
                                 except OSError:
                                     pass  # Directory not empty, skip
-                        
+
                         # Remove main directory
                         if chroma_db_path.exists():
                             chroma_db_path.rmdir()
-                        
+
                         success = True
                         logger.info("Successfully removed ChromaDB directory (individual file method)")
                         break
-                    
+
                     # Method 3: Rename and create new directory
                     else:
                         logger.info(f"Attempt {attempt + 1}: Using rename method as fallback...")
                         backup_name = f"{CHROMA_DB_PATH}_backup_{int(time.time())}"
                         backup_path = Path(backup_name)
-                        
+
                         chroma_db_path.rename(backup_path)
                         logger.info(f"Renamed old ChromaDB directory to {backup_name}")
-                        
+
                         # Create new empty directory
                         chroma_db_path.mkdir(parents=True, exist_ok=True)
                         success = True
                         logger.info("Created new empty ChromaDB directory")
                         break
-                
+
                 except Exception as e:
                     logger.warning(f"Attempt {attempt + 1} failed: {e}")
                     if attempt < max_retries - 1:
@@ -1899,7 +1897,7 @@ async def clear_knowledge_base():
                     else:
                         logger.error(f"All {max_retries} attempts to clear ChromaDB failed")
                         # Don't raise exception, just log and continue
-            
+
             if not success:
                 logger.warning("Could not fully clear ChromaDB directory, but continuing with re-initialization")
         else:
@@ -1909,13 +1907,13 @@ async def clear_knowledge_base():
         try:
             # Ensure the ChromaDB directory exists
             chroma_db_path.mkdir(parents=True, exist_ok=True)
-            
+
             # Re-initialize RAG system
             initialize_rag_system()
             logger.info("RAG system re-initialized successfully.")
-            
+
             return {"message": "Knowledge base cleared and RAG system re-initialized successfully."}
-            
+
         except Exception as init_error:
             logger.error(f"Error re-initializing RAG system: {init_error}")
             return {
@@ -1982,8 +1980,8 @@ async def get_status():
         "rag_system": rag_status,
         "database": db_status,
         "counts": {
-            "knowledge_base_metadata": kb_count, # Count in SQLite
-            "knowledge_base_chunks_in_chroma": chroma_count, # Count in Chroma
+            "knowledge_base_metadata": kb_count,
+            "knowledge_base_chunks_in_chroma": chroma_count,
             "sitemap_entries": sitemap_count,
             "bot_configurations": config_count,
             "chat_logs": chat_log_count,
