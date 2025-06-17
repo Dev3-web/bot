@@ -18,7 +18,3 @@ pandas
 openai
 playwright
 aiohttp
-asyncio
-sys
-gc
-pathlib
