@@ -693,6 +693,67 @@ def generate_goals_with_ai(crawled_data: List[Dict]) -> List[str]:
         logger.error(f"Error calling OpenAI to generate goals: {e}")
         return []
 
+def generate_test_scenarios_with_ai(crawled_data: List[Dict]) -> List[str]:
+    """
+    Uses OpenAI's GPT model to analyze website content and suggest test scenarios 
+    (i.e., sample user questions to simulate real usage).
+    """
+    if not OPENAI_API_KEY:
+        logger.warning("OpenAI API key not set. Cannot generate AI test scenarios.")
+        return []
+
+    if not crawled_data:
+        logger.warning("No crawled data provided to generate test scenarios.")
+        return []
+
+    logger.info("Generating test scenarios with AI...")
+
+    # Extract content for context
+    context = ""
+    relevant_pages = [p for p in crawled_data if p.get('content')]
+    for i, page in enumerate(relevant_pages[:5]):
+        context += f"--- Page {i+1}: {page.get('title', '')} ---\n"
+        context += page.get('content', '')[:2000]
+        context += "\n\n"
+
+    if not context.strip():
+        logger.warning("No valid content for test scenario generation.")
+        return []
+
+    # Prompt for AI
+    prompt = f"""
+    You are a product experience strategist helping to simulate how users might interact with a chatbot on a website.
+
+    Based on the following website content, generate a list of realistic test questions or help-seeking scenarios a user might ask to test the system.
+
+    Guidelines:
+    - Each scenario should be short (preferably one sentence) and represent a user question or intent (e.g., "How do I reset my password?", "Can you show me the pricing options?")
+    - Avoid bullet points or numbers.
+    - Just provide a clean, new-line-separated list.
+
+    Website Content:
+    {context}
+    """
+
+    try:
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3, openai_api_key=OPENAI_API_KEY)
+        response = llm.invoke(prompt)
+
+        raw_scenarios = response.content.strip()
+        scenarios = [
+            re.sub(r'^\s*[\d\.\-\*]+\s*', '', line).strip()
+            for line in raw_scenarios.split('\n')
+            if line.strip()
+        ]
+
+        logger.info(f"AI suggested test scenarios: {scenarios}")
+        return scenarios[:8]  # Limit to top 8 test cases
+
+    except Exception as e:
+        logger.error(f"Error generating AI test scenarios: {e}")
+        return []
+
+
 async def cleanup_chroma_db(chroma_db_path: str, max_retries: int = 3) -> bool:
     """
     Robust ChromaDB cleanup function that tries multiple approaches.
