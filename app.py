@@ -25,8 +25,7 @@ st.set_page_config(
 )
 
 # Backend API URL
-API_BASE_URL = "http://35.209.111.61/api1/"
-"soup"
+API_BASE_URL = "http://35.206.118.178/api1/"
 
 # Custom CSS for better styling
 st.markdown("""
