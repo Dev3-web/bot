@@ -25,7 +25,8 @@ st.set_page_config(
 )
 
 # Backend API URL
-API_BASE_URL = "https://bot-2-djl5.onrender.com"
+API_BASE_URL = "http://35.209.111.61/api1/"
+"soup"
 
 # Custom CSS for better styling
 st.markdown("""
