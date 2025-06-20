@@ -1845,149 +1845,157 @@ async def get_sitemap():
          logger.error(f"Error fetching sitemap: {e}")
          raise HTTPException(status_code=500, detail=f"Error fetching sitemap: {e}")
 
+@app.delete("/api/knowledge-base/document/{filename:path}")
+async def delete_document_from_knowledge_base(filename: str):
+    decoded_filename = unquote(filename)
+    logger.info(f"Received DELETE request for document: {decoded_filename}")
+
+    if not rag_chain or not hasattr(rag_chain, 'retriever') or \
+       not hasattr(rag_chain.retriever, 'vectorstore') or \
+       not isinstance(rag_chain.retriever.vectorstore, Chroma):
+        logger.error("RAG system or Chroma vector store not properly initialized for deletion.")
+        raise HTTPException(status_code=500, detail="RAG system/vector store not available.")
+
+    vectorstore = rag_chain.retriever.vectorstore
+    rows_deleted_sqlite = 0
+    chroma_chunks_deleted_count = 0
+    doc_ids_to_delete = []
+
+    # Step 1: Try to find document IDs in Chroma first (before deleting from SQLite)
+    # This is because 'source' metadata comes from the original filename.
+    try:
+        # Langchain's Chroma get() method can filter by metadata.
+        # It returns a dict with 'ids', 'embeddings', 'metadatas', 'documents'.
+        retrieved_docs_info = vectorstore.get(where={"source": decoded_filename})
+        doc_ids_to_delete = retrieved_docs_info.get('ids', [])
+
+        if not doc_ids_to_delete:
+            logger.info(f"No document chunks found in Chroma with source '{decoded_filename}'.")
+        else:
+            logger.info(f"Found {len(doc_ids_to_delete)} document chunks in Chroma for '{decoded_filename}'.")
+
+    except Exception as e:
+        logger.error(f"Error querying Chroma for document chunks of '{decoded_filename}': {e}", exc_info=True)
+        # Proceed to SQLite deletion attempt, but log this issue.
+        # No HTTP Exception here yet, as SQLite might still succeed or also find nothing.
+
+    # Step 2: Delete from SQLite
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            # Important: Get the ID or other info IF NEEDED before deleting
+            # For now, filename is the key.
+            cursor.execute("DELETE FROM knowledge_base WHERE filename = ?", (decoded_filename,))
+            rows_deleted_sqlite = cursor.rowcount
+            conn.commit()
+        
+        if rows_deleted_sqlite == 0:
+            logger.warning(f"Document '{decoded_filename}' not found in SQLite knowledge_base table.")
+            # If also not found in Chroma, then it's a true 404
+            if not doc_ids_to_delete:
+                raise HTTPException(status_code=404, detail=f"Document '{decoded_filename}' not found.")
+        else:
+            logger.info(f"Successfully deleted '{decoded_filename}' metadata from SQLite.")
+
+    except HTTPException as http_exc: # Propagate 404 if raised
+        raise http_exc
+    except sqlite3.Error as e:
+        logger.error(f"SQLite error deleting document metadata for '{decoded_filename}': {e}")
+        raise HTTPException(status_code=500, detail=f"Database error deleting document metadata: {str(e)}")
+
+    # Step 3: Delete from Chroma if IDs were found
+    if doc_ids_to_delete:
+        try:
+            vectorstore.delete(ids=doc_ids_to_delete)
+            chroma_chunks_deleted_count = len(doc_ids_to_delete)
+            logger.info(f"Successfully deleted {chroma_chunks_deleted_count} chunks for '{decoded_filename}' from Chroma.")
+        except Exception as e:
+            logger.error(f"Chroma DB error deleting document chunks for '{decoded_filename}': {e}", exc_info=True)
+            # If SQLite deletion succeeded but Chroma failed, this is a partial failure.
+            if rows_deleted_sqlite > 0:
+                 return JSONResponse(
+                    status_code=207, # Multi-Status
+                    content={
+                        "message": f"Successfully deleted '{decoded_filename}' from database metadata, "
+                                   f"but failed to delete {len(doc_ids_to_delete)} associated data chunks from vector store. "
+                                   f"Please check logs. Error: {str(e)}",
+                        "sqlite_deleted": rows_deleted_sqlite > 0,
+                        "chroma_expected_deletions": len(doc_ids_to_delete),
+                        "chroma_actual_deletions": 0
+                    }
+                )
+            # If SQLite also failed to find it, but Chroma did (should be rare if consistent), still raise error
+            raise HTTPException(status_code=500, detail=f"Vector store error deleting document data: {str(e)}")
+
+    # Final success message
+    return {
+        "message": f"Document '{decoded_filename}' and its associated data successfully processed for deletion.",
+        "sqlite_deleted_metadata_rows": rows_deleted_sqlite,
+        "chroma_deleted_chunks": chroma_chunks_deleted_count
+    }
+
 @app.delete("/api/knowledge-base")
 async def clear_knowledge_base():
-    """Deletes all documents metadata from SQLite and clears Chroma DB."""
     global rag_chain, chroma_client
-
-    logger.info("Received DELETE request for /api/knowledge-base")
-
+    logger.info("Received DELETE request for /api/knowledge-base (full clear)")
     if not rag_chain:
-        raise HTTPException(status_code=500, detail="RAG system is not initialized. Cannot clear knowledge base.")
+        logger.warning("RAG system not initialized. Attempting cleanup anyway.")
+    
+    # Close ChromaDB client if it exists (Langchain's Chroma wrapper handles its own client)
+    # The `chroma_client` global might be for a direct `chromadb.Client` instance
+    # if you were using one elsewhere, which you are not explicitly here for RAG.
+    # So, this part might be less relevant unless `chroma_client` is used by `cleanup_chroma_db`.
+    if 'chroma_client' in globals() and chroma_client: # Check if chroma_client is defined and not None
+        try:
+            if hasattr(chroma_client, 'close'): chroma_client.close()
+            elif hasattr(chroma_client, 'reset'): chroma_client.reset() # Some versions might have reset
+            logger.info("Closed direct ChromaDB client connection if it existed.")
+        except Exception as e:
+            logger.warning(f"Error closing direct ChromaDB client: {e}")
+        finally:
+            chroma_client = None
 
+    # Reset RAG chain reference. This effectively "disconnects" it from the old vector store.
+    # The vector store itself (files on disk) needs separate handling.
+    rag_chain = None 
+    gc.collect()
+    await asyncio.sleep(0.1) # Give a moment for resources to release
+
+    # Clear SQLite metadata
     try:
-        # Step 1: Properly close existing RAG system and ChromaDB connections
-        logger.info("Shutting down existing RAG system connections...")
-
-        # Close ChromaDB client if it exists
-        if chroma_client:
-            try:
-                if hasattr(chroma_client, 'close'):
-                    chroma_client.close()
-                elif hasattr(chroma_client, 'reset'):
-                    chroma_client.reset()
-                logger.info("Closed ChromaDB client connection")
-            except Exception as e:
-                logger.warning(f"Error closing ChromaDB client: {e}")
-            finally:
-                chroma_client = None
-
-        # Reset RAG chain reference
-        rag_chain = None
-
-        # Force garbage collection to release file handles
-        gc.collect()
-
-        # Small delay to ensure file handles are released
-        await asyncio.sleep(0.1)
-
-        # Step 2: Clear SQLite metadata
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM knowledge_base")
             conn.commit()
             logger.info("Cleared knowledge_base table in SQLite.")
-
-        # Step 3: Clear Chroma DB directory with robust error handling
-        chroma_db_path = Path(CHROMA_DB_PATH)
-
-        if chroma_db_path.exists():
-            logger.info(f"Clearing Chroma DB directory: {CHROMA_DB_PATH}")
-
-            success = False
-            max_retries = 3
-
-            for attempt in range(max_retries):
-                try:
-                    # Method 1: Try direct removal
-                    if attempt == 0:
-                        shutil.rmtree(chroma_db_path)
-                        success = True
-                        logger.info("Successfully removed ChromaDB directory (direct method)")
-                        break
-
-                    # Method 2: Remove files individually then directory
-                    elif attempt == 1:
-                        logger.info(f"Attempt {attempt + 1}: Removing files individually...")
-
-                        # Remove all files first
-                        for file_path in chroma_db_path.rglob("*"):
-                            if file_path.is_file():
-                                try:
-                                    file_path.unlink()
-                                except (PermissionError, OSError) as e:
-                                    logger.warning(f"Could not delete file {file_path}: {e}")
-
-                        # Remove empty directories
-                        for dir_path in sorted(chroma_db_path.rglob("*"), key=lambda p: len(p.parts), reverse=True):
-                            if dir_path.is_dir():
-                                try:
-                                    dir_path.rmdir()
-                                except OSError:
-                                    pass  # Directory not empty, skip
-
-                        # Remove main directory
-                        if chroma_db_path.exists():
-                            chroma_db_path.rmdir()
-
-                        success = True
-                        logger.info("Successfully removed ChromaDB directory (individual file method)")
-                        break
-
-                    # Method 3: Rename and create new directory
-                    else:
-                        logger.info(f"Attempt {attempt + 1}: Using rename method as fallback...")
-                        backup_name = f"{CHROMA_DB_PATH}_backup_{int(time.time())}"
-                        backup_path = Path(backup_name)
-
-                        chroma_db_path.rename(backup_path)
-                        logger.info(f"Renamed old ChromaDB directory to {backup_name}")
-
-                        # Create new empty directory
-                        chroma_db_path.mkdir(parents=True, exist_ok=True)
-                        success = True
-                        logger.info("Created new empty ChromaDB directory")
-                        break
-
-                except Exception as e:
-                    logger.warning(f"Attempt {attempt + 1} failed: {e}")
-                    if attempt < max_retries - 1:
-                        # Wait before retry
-                        await asyncio.sleep(1)
-                        gc.collect()  # Try to free up resources
-                    else:
-                        logger.error(f"All {max_retries} attempts to clear ChromaDB failed")
-                        # Don't raise exception, just log and continue
-
-            if not success:
-                logger.warning("Could not fully clear ChromaDB directory, but continuing with re-initialization")
-        else:
-            logger.warning(f"Chroma DB directory not found at {CHROMA_DB_PATH}. Nothing to clear.")
-
-        # Step 4: Re-initialize RAG system
-        try:
-            # Ensure the ChromaDB directory exists
-            chroma_db_path.mkdir(parents=True, exist_ok=True)
-
-            # Re-initialize RAG system
-            initialize_rag_system()
-            logger.info("RAG system re-initialized successfully.")
-
-            return {"message": "Knowledge base cleared and RAG system re-initialized successfully."}
-
-        except Exception as init_error:
-            logger.error(f"Error re-initializing RAG system: {init_error}")
-            return {
-                "message": "Knowledge base cleared but RAG system re-initialization failed. Please restart the application.",
-                "warning": str(init_error)
-            }
-
     except sqlite3.Error as db_error:
-        logger.error(f"Database error clearing knowledge base: {db_error}")
-        raise HTTPException(status_code=500, detail=f"Database error clearing knowledge base: {db_error}")
-    except Exception as e:
-        logger.error(f"Error clearing knowledge base: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
+        logger.error(f"Database error clearing knowledge base table: {db_error}")
+        # Don't raise immediately, try to clear Chroma too.
+
+    # Clear Chroma DB directory using the robust cleanup function
+    chroma_db_cleared_successfully = await cleanup_chroma_db(CHROMA_DB_PATH)
+    if chroma_db_cleared_successfully:
+        logger.info(f"Successfully cleared Chroma DB directory: {CHROMA_DB_PATH}")
+    else:
+        logger.error(f"Failed to fully clear Chroma DB directory: {CHROMA_DB_PATH}. Manual cleanup might be needed.")
+
+    # Re-initialize RAG system to create a fresh, empty vector store
+    try:
+        Path(CHROMA_DB_PATH).mkdir(parents=True, exist_ok=True) # Ensure dir exists for new init
+        initialize_rag_system()
+        logger.info("RAG system re-initialized successfully after clearing.")
+        return {"message": "Knowledge base cleared and RAG system re-initialized successfully."}
+    except Exception as init_error:
+        logger.error(f"Error re-initializing RAG system after clearing: {init_error}", exc_info=True)
+        return JSONResponse(
+            status_code=500, # Internal Server Error
+            content={
+                "message": "Knowledge base tables cleared, and ChromaDB directory removed (if possible), "
+                           "but RAG system re-initialization failed. Please check logs and restart the application.",
+                "warning": str(init_error),
+                "chroma_dir_cleared": chroma_db_cleared_successfully
+            }
+        )
 
 @app.get("/api/status")
 async def get_status():

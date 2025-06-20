@@ -15,6 +15,7 @@ from io import BytesIO
 import re
 from typing import List, Dict, Set
 import sqlite3
+import urllib.parse
 
 # Configure Streamlit page
 st.set_page_config(
@@ -25,7 +26,7 @@ st.set_page_config(
 )
 
 # Backend API URL
-API_BASE_URL = "http://35.206.118.178/api1/"
+API_BASE_URL = "http://127.0.0.1:8000"
 
 # Custom CSS for better styling
 st.markdown("""
@@ -142,45 +143,143 @@ def step1_upload_sources():
     )
 
     if uploaded_files:
-        if st.button("Upload Documents", key="upload_docs"):
+        if st.button("Upload Documents", key="upload_docs_button"):
             with st.spinner("Uploading documents..."):
-                # Prepare files for upload
                 files_to_upload = []
-                for file in uploaded_files:
-                    files_to_upload.append(("files", (file.name, file.getvalue(), file.type)))
+                for file_obj in uploaded_files:
+                    files_to_upload.append(("files", (file_obj.name, file_obj.getvalue(), file_obj.type)))
 
-                # Make API request
                 try:
                     url = f"{API_BASE_URL}/api/upload-documents"
-                    response = requests.post(url, files=files_to_upload)
+                    response = requests.post(url, files=files_to_upload, timeout=120) # Added timeout
 
                     if response.status_code == 200:
                         result = response.json()
-                        st.session_state.uploaded_files = result.get('uploaded_files', [])
-                        st.markdown(f"""
-                        <div class="success-box">
-                        ✅ Successfully uploaded documents!
-                        </div>
-                        """, unsafe_allow_html=True)
+                        st.session_state.uploaded_files_result = result
+                        
+                        success_messages = []
+                        failure_messages = []
+                        skipped_messages = []
+
+                        for item in result.get('results', []):
+                            if item.get('status') == 'uploaded and processed':
+                                success_messages.append(item['filename'])
+                            elif 'skipped' in item.get('status', ''):
+                                skipped_messages.append(f"{item['filename']} ({item['status']})")
+                            else:
+                                failure_messages.append(f"{item['filename']} ({item['status']})")
+                        
+                        if success_messages:
+                            st.success(f"Successfully uploaded: {', '.join(success_messages)}")
+                        if skipped_messages:
+                            st.info(f"Skipped: {', '.join(skipped_messages)}")
+                        if failure_messages:
+                            st.error(f"Failed to process: {', '.join(failure_messages)}")
+                        
                         time.sleep(1)
-                        st.session_state.current_step = 2
                         st.rerun()
                     else:
                         st.error(f"Upload failed: {response.status_code} - {response.text}")
                 except Exception as e:
                     st.error(f"Upload error: {str(e)}")
 
-    # Display current knowledge base
-    knowledge_base = make_api_request("/api/knowledge-base")
-    if knowledge_base and knowledge_base.get('documents'):
-        st.subheader("📄 Current Knowledge Base")
-        df = pd.DataFrame(knowledge_base['documents'])
-        st.dataframe(df, use_container_width=True)
+    st.subheader("📄 Current Knowledge Base")
+    
+    knowledge_base_response = make_api_request("/api/knowledge-base")
 
-        if st.button("Next Step: Generate Sitemap", key="next_step1"):
-            st.session_state.current_step = 2
-            st.rerun()
+    if knowledge_base_response and isinstance(knowledge_base_response, dict) and 'documents' in knowledge_base_response:
+        documents = knowledge_base_response['documents']
+        if not documents:
+            st.info("No documents currently in the knowledge base.")
+        else:
+            # Adjusted column ratios for compactness
+            # Filename, Type, Upload Date (shortened), Action
+            header_cols = st.columns([4, 1, 1.5, 1.2]) 
+            with header_cols[0]: st.markdown("**Filename**")
+            with header_cols[1]: st.markdown("**Type**")
+            with header_cols[2]: st.markdown("**Uploaded**")
+            with header_cols[3]: st.markdown("**Action**")
+            st.divider() # Use st.divider() for a cleaner, consistent separator
 
+            for doc in documents:
+                # Use a unique identifier from the doc if available, otherwise combine filename and a part of date for key
+                doc_key_part = doc.get('id', doc.get('filename', str(time.time()))) 
+                doc_filename = doc.get('filename', 'N/A')
+                doc_type = doc.get('file_type', 'N/A')
+                doc_upload_date_str = doc.get('upload_date', '')
+
+                doc_upload_date_formatted = doc_upload_date_str # Default to original string
+                if doc_upload_date_str:
+                    try:
+                        # Attempt to parse ISO format, handling potential 'Z' for UTC
+                        dt_obj = datetime.fromisoformat(doc_upload_date_str.replace("Z", "+00:00"))
+                        # Shortened date format
+                        doc_upload_date_formatted = dt_obj.strftime('%y-%m-%d %H:%M') 
+                    except ValueError:
+                        # If parsing fails, try to show at least the date part if it's a longer string
+                        doc_upload_date_formatted = doc_upload_date_str.split("T")[0] if "T" in doc_upload_date_str else doc_upload_date_str[:10]
+
+
+                row_cols = st.columns([4, 1, 1.5, 1.2]) # Same ratios as header
+                row_cols[0].text(doc_filename) # Use st.text for more compact display if appropriate
+                row_cols[1].text(doc_type)
+                row_cols[2].text(doc_upload_date_formatted)
+
+                with row_cols[3]:
+                    # Create a more unique session state key
+                    confirm_key = f"confirm_delete_{doc_key_part}_{doc_filename.replace('.', '_').replace(' ', '_')}"
+
+                    if st.session_state.get(confirm_key, False):
+                        # Display confirmation message more prominently
+                        st.warning(f"Delete **{doc_filename}**?", icon="⚠️")
+                        
+                        confirm_action_cols = st.columns(2)
+                        with confirm_action_cols[0]:
+                            if st.button("Yes", key=f"do_delete_{confirm_key}", type="primary"):
+                                try:
+                                    encoded_filename = urllib.parse.quote_plus(doc_filename)
+                                    delete_url = f"{API_BASE_URL}/api/knowledge-base/document/{encoded_filename}"
+                                    
+                                    del_response = requests.delete(delete_url, timeout=30)
+
+                                    if del_response.status_code == 200:
+                                        st.success(f"'{doc_filename}' deleted.")
+                                    elif del_response.status_code == 207:
+                                        st.warning(del_response.json().get("message", f"Partial deletion of '{doc_filename}'."))
+                                    elif del_response.status_code == 404:
+                                        st.warning(f"'{doc_filename}' not found. Already deleted?")
+                                    else:
+                                        st.error(f"Delete failed: {del_response.status_code} - {del_response.text}")
+                                except Exception as e_del:
+                                    st.error(f"Deletion error: {str(e_del)}")
+                                finally:
+                                    st.session_state[confirm_key] = False
+                                    st.rerun()
+                        with confirm_action_cols[1]:
+                            if st.button("No", key=f"cancel_delete_{confirm_key}"):
+                                st.session_state[confirm_key] = False
+                                st.rerun()
+                    else:
+                        # Using just an icon for the delete button can save space
+                        if st.button("🗑️", key=f"delete_btn_{confirm_key}", help=f"Delete {doc_filename}"):
+                            st.session_state[confirm_key] = True
+                            st.rerun()
+            # Removed the st.markdown("---") from here to reduce vertical space between items.
+            # st.divider() is now only after the header. Add it back inside the loop if it feels too cramped.
+            # Example: if you want a divider after each item:
+            # ...
+            # with row_cols[3]:
+            #     ...
+            # st.divider() # This would add a divider after each document row
+
+    else:
+        st.info("No documents in knowledge base or unable to fetch them.")
+
+    can_proceed = True 
+    if st.button("Next Step: Generate Sitemap", key="next_step_sitemap_button", disabled=not can_proceed):
+        st.session_state.current_step = 2
+        st.rerun()
+        
 def step2_generate_sitemap():
     """Step 2: Generate sitemap automatically"""
     st.markdown('<div class="step-header"><h2>🗺️ Step 2: Generate Website Sitemap & Goals</h2></div>', unsafe_allow_html=True)
