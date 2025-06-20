@@ -298,7 +298,6 @@ def step2_generate_sitemap():
                 st.markdown(f"""
                 <div class="success-box">
                 ✅ Sitemap generated and goals suggested successfully!
-                <br><strong>Pages Found:</strong> {result.get('pages_found', 'N/A')}
                 </div>
                 """, unsafe_allow_html=True)
 
