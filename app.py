@@ -26,7 +26,7 @@ st.set_page_config(
 )
 
 # Backend API URL
-API_BASE_URL = "http://35.206.118.178/api1/"
+API_BASE_URL = "https://hindustangpt.in/api1/"
 
 # Custom CSS for better styling
 st.markdown("""
